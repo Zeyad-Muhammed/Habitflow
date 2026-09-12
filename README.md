@@ -8,13 +8,19 @@ A Flutter habit-tracking app with full Arabic/English support, dark/light themes
 
 ## Features
 
-- Habit tracking with daily progress
-- Adhkar (daily remembrance) with a tasbih counter
-- Qibla direction helper
-- Bilingual UI (Arabic / English) with RTL support
-- Dark and light themes
-- Multiple theme color choices
-- Auto-progress levels and badges
+- Onboarding flow and account login/signup with password recovery
+- Habit creation: name, icon picker, weekly schedule (days), weekly goal, progress unit (pages/minutes), notes
+- Daily check-ins with streaks and consistency tracking
+- XP points, levels and 14 achievements/badges
+- Daily challenge (Pro)
+- Daily mood check-in with smart personal insights (Pro)
+- Quote of the day and time-based greeting on the home screen
+- Statistics dashboard with charts (completion %, streaks, achievements)
+- Habit detail view with per-habit stats, edit and delete
+- Daily reminder notifications (Pro)
+- Android home-screen widget showing habit progress on the launcher
+- Settings: Arabic/English (RTL) toggle, dark/light mode, 5 theme colors, reminders, backup & restore, Pro
+- Pro plan: unlimited habits, no ads, daily reminders, daily challenge, mood & insights, backup & restore
 
 ## Languages & Technologies
 
