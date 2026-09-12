@@ -4,7 +4,6 @@
 *.pyc
 *.swp
 .DS_Store
-/HabitFlow.apk
 .atom/
 .build/
 .buildlog/

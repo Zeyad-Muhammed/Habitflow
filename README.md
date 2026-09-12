@@ -66,4 +66,4 @@ flutter run
 flutter build apk --release
 ```
 
-Requires Flutter SDK. The compiled APK is not tracked in the repository.
+Requires Flutter SDK. The compiled APK (`HabitFlow.apk`) is included in the repository.
