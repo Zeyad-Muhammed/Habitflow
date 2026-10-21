@@ -28,6 +28,7 @@ import 'package:google_sign_in/google_sign_in.dart';
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Language.load();
+  listenForWidgetActions();
   runApp(const HabitFlowApp());
   refreshWidget();
 }
@@ -163,6 +164,7 @@ class AuthService {
   static Future<void> logout() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool('auth_logged_in', false);
+    refreshWidget();
   }
 
   static Future<void> setPro(bool pro) async {
@@ -170,6 +172,7 @@ class AuthService {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool('isPro', pro);
     if (!pro) { await prefs.setBool('proFromBilling', false); proFromBilling = false; }
+    refreshWidget();
   }
 
   static Future<void> setProSourceBilling(bool fromBilling) async {
@@ -827,11 +830,13 @@ class HabitFlowAppState extends State<HabitFlowApp> {
 
   void setDarkMode(bool dark) {
     setState(() => _darkMode = dark);
-    SharedPreferences.getInstance().then((p) => p.setBool('darkMode', dark));
+    SharedPreferences.getInstance()
+        .then((p) => p.setBool('darkMode', dark))
+        .then((_) => refreshWidget());
   }
 
   void setLang(String code) {
-    Language.set(code);
+    Language.set(code).then((_) => refreshWidget());
     setState(() => _lang = code);
   }
 
@@ -1950,7 +1955,27 @@ const MethodChannel _widgetChannel = MethodChannel('com.novu.HabitFlow/widget');
 void refreshWidget() {
   // The channel only exists on Android while the activity is running (not in
   // tests, other platforms or the background notification isolate).
-  _widgetChannel.invokeMethod('refresh').catchError((_) => null);
+  // `pro` is the effective plan (including test builds) for the Pro widgets.
+  _widgetChannel
+      .invokeMethod('refresh', {'pro': AuthService.isProUser})
+      .catchError((_) => null);
+}
+
+/// Native side tells us a widget was tapped while the app was running.
+void listenForWidgetActions() {
+  _widgetChannel.setMethodCallHandler((call) async {
+    if (call.method == 'widgetAction') HomePage.onWidgetAction?.call();
+  });
+}
+
+/// Action from the last widget tap (`pro`, `habit:<id>`, `mood:<n>`,
+/// `stats`, `open`), or null.
+Future<String?> takeWidgetAction() async {
+  try {
+    return await _widgetChannel.invokeMethod<String>('takeAction');
+  } catch (_) {
+    return null;
+  }
 }
 
 class NotificationService {
@@ -2632,6 +2657,7 @@ class XpSystem {
     final oldXp = p.getInt(_key()) ?? 0;
     final newXp = oldXp + amount;
     await p.setInt(_key(), newXp);
+    refreshWidget();
     return (
       xp: newXp,
       level: levelForXp(newXp),
@@ -2824,6 +2850,7 @@ class MoodSystem {
   static Future<bool> save(int mood) async {
     final p = await SharedPreferences.getInstance();
     await p.setInt(_moodKey(AuthService.email, dayKey(clock())), mood);
+    refreshWidget();
     if (mood < 4) return false;
     return (await XpSystem.addOnce('mood', 5)).awarded;
   }
@@ -3315,6 +3342,9 @@ class HomePage extends StatefulWidget {
 
   static VoidCallback? reload;
 
+  /// Called when a home-screen widget was tapped while the app was open.
+  static VoidCallback? onWidgetAction;
+
   final ValueChanged<List<Habit>>? onStatsChanged;
   final ValueChanged<int>? onNavigate;
 
@@ -3322,7 +3352,7 @@ class HomePage extends StatefulWidget {
   State<HomePage> createState() => _HomePageState();
 }
 
-class _HomePageState extends State<HomePage> {
+class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   List<Habit> habits = [];
   ({String id, String title, String desc, int target, int xp})? _challenge;
   int _challengeProg = 0;
@@ -3335,11 +3365,65 @@ class _HomePageState extends State<HomePage> {
   void initState() {
     super.initState();
     HomePage.reload = _loadHabits;
+    HomePage.onWidgetAction = _handleWidgetAction;
+    WidgetsBinding.instance.addObserver(this);
     // Extras (daily challenge, insights) depend on the habit list, so build
     // them only after the habits are loaded.
-    _loadHabits().then((_) => _loadExtras());
+    _loadHabits().then((_) {
+      _loadExtras();
+      _handleWidgetAction();
+    });
     _refreshXp();
     NotificationService.init();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    if (HomePage.onWidgetAction == _handleWidgetAction) {
+      HomePage.onWidgetAction = null;
+    }
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) _reloadFromDisk();
+  }
+
+  /// Home-screen widgets edit the stored habits while the app is in the
+  /// background. SharedPreferences caches values in memory, so re-read them
+  /// before showing (and later saving) the list, or a widget tick would be
+  /// overwritten.
+  Future<void> _reloadFromDisk() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.reload();
+    await _loadHabits();
+    await _loadExtras();
+    await _refreshXp();
+  }
+
+  Future<void> _handleWidgetAction() async {
+    final action = await takeWidgetAction();
+    if (action == null || !mounted) return;
+    // A tap that came in while the app was backgrounded may have edited the
+    // habits first, so start from the stored data.
+    await _reloadFromDisk();
+    if (!mounted) return;
+    if (action == 'pro') {
+      Navigator.push(
+          context, MaterialPageRoute(builder: (_) => const ProPage()));
+    } else if (action == 'stats') {
+      widget.onNavigate?.call(1);
+    } else if (action.startsWith('mood:')) {
+      final m = int.tryParse(action.substring(5));
+      if (m != null && m >= 1 && m <= 5) await _setMood(m);
+    } else if (action.startsWith('habit:')) {
+      final id = int.tryParse(action.substring(6));
+      final habit = habits.where((h) => h.id == id).firstOrNull;
+      // Measurable habits open the log dialog, timer habits the countdown.
+      if (habit != null) await _toggleToday(habit);
+    }
   }
 
   Future<void> _loadExtras() async {

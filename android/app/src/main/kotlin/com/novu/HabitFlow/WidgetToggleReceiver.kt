@@ -3,28 +3,25 @@ package com.novu.HabitFlow
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.appwidget.AppWidgetManager
 
-// Handles taps from widget rows: flips today's completion for the
-// habit, then re-renders every HabitFlow widget.
-
+// Handles the ✔ taps from widgets and the midnight / clock-change refreshes.
 class WidgetToggleReceiver : BroadcastReceiver() {
 
+    companion object {
+        const val ACTION_TOGGLE = "com.novu.HabitFlow.TOGGLE_HABIT"
+        const val ACTION_MIDNIGHT = "com.novu.HabitFlow.WIDGET_MIDNIGHT"
+        const val EXTRA_HABIT_ID = "habitId"
+    }
+
     override fun onReceive(context: Context, intent: Intent) {
-        if (intent.action != WidgetData.ACTION_TOGGLE) return
-        val habitId = intent.getStringExtra(WidgetData.EXTRA_HABIT_ID) ?: return
-        val widgetId = intent.getIntExtra(WidgetData.EXTRA_WIDGET_ID, AppWidgetManager.INVALID_APPWIDGET_ID)
-
-        val ok = WidgetData.toggleToday(context, habitId)
-        if (!ok) {
-            // Measurable / quit habits need the app (amount entry / relapse log).
-            context.startActivity(
-                Intent(context, MainActivity::class.java)
-                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            )
+        if (intent.action == ACTION_TOGGLE) {
+            val habitId = intent.getStringExtra(EXTRA_HABIT_ID) ?: return
+            if (WidgetData.toggleToday(context, habitId) == ToggleResult.NEEDS_APP) {
+                // Measurable / timer habits are logged in the app.
+                WidgetUi.openApp(context, "habit:$habitId").send()
+            }
         }
-
-        HabitWidgetProvider.refreshAll(context)
-        HabitSingleWidgetProvider.refreshAll(context)
+        // Toggle, midnight, time/timezone change, boot or app update.
+        WidgetUi.refreshAll(context)
     }
 }

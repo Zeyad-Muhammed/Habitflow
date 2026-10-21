@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android" android:id="@+id/w_root" android:layout_width="match_parent" android:layout_height="match_parent" android:background="@drawable/w_bg_dark" android:orientation="vertical" android:padding="12dp">
+    <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:orientation="horizontal" android:gravity="center_vertical">
+        <TextView android:id="@+id/w_title" android:layout_width="0dp" android:layout_height="wrap_content"
+            android:layout_weight="1" android:text="Today" android:textSize="15sp" android:textStyle="bold"
+            android:textColor="#ECEDF0" android:textAlignment="viewStart" android:maxLines="1" android:ellipsize="end"/>
+        <TextView android:id="@+id/w_count" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="2 of 5" android:textSize="12sp" android:textColor="#CDBDFF" android:textStyle="bold" android:maxLines="1" android:ellipsize="end" />
+    </LinearLayout>
+    <ImageView android:id="@+id/w_bar" android:layout_width="match_parent" android:layout_height="6dp"
+        android:layout_marginTop="6dp" android:scaleType="fitXY" android:importantForAccessibility="no"/>
+    <LinearLayout android:id="@+id/w_rows" android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:orientation="vertical" android:layout_marginTop="2dp">
+    <LinearLayout android:id="@+id/w_row0" android:layout_width="match_parent" android:layout_height="40dp"
+        android:layout_marginTop="4dp" android:orientation="horizontal" android:gravity="center_vertical"
+        android:paddingStart="6dp" android:paddingEnd="4dp" android:background="@drawable/w_chip_dark">
+        <ImageView android:id="@+id/w_av0" android:layout_width="26dp" android:layout_height="26dp"
+            android:src="@mipmap/ic_launcher" android:importantForAccessibility="no"/>
+        <TextView android:id="@+id/w_name0" android:layout_width="0dp" android:layout_height="wrap_content"
+            android:layout_weight="1" android:layout_marginStart="8dp" android:layout_marginEnd="6dp"
+            android:text="Morning walk" android:textSize="14sp" android:textColor="#ECEDF0" android:textAlignment="viewStart"
+            android:maxLines="1" android:ellipsize="end"/>
+        <TextView android:id="@+id/w_meta0" android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:layout_marginEnd="6dp" android:text="🔥 3" android:textSize="11sp" android:textColor="#9AA0A6" android:maxLines="1"/>
+        <ImageView android:id="@+id/w_chk0" android:layout_width="34dp" android:layout_height="34dp"
+            android:padding="2dp" android:src="@mipmap/ic_launcher" android:contentDescription="Done"/>
+    </LinearLayout>
+    <LinearLayout android:id="@+id/w_row1" android:layout_width="match_parent" android:layout_height="40dp"
+        android:layout_marginTop="4dp" android:orientation="horizontal" android:gravity="center_vertical"
+        android:paddingStart="6dp" android:paddingEnd="4dp" android:background="@drawable/w_chip_dark">
+        <ImageView android:id="@+id/w_av1" android:layout_width="26dp" android:layout_height="26dp"
+            android:src="@mipmap/ic_launcher" android:importantForAccessibility="no"/>
+        <TextView android:id="@+id/w_name1" android:layout_width="0dp" android:layout_height="wrap_content"
+            android:layout_weight="1" android:layout_marginStart="8dp" android:layout_marginEnd="6dp"
+            android:text="Read 20 pages" android:textSize="14sp" android:textColor="#ECEDF0" android:textAlignment="viewStart"
+            android:maxLines="1" android:ellipsize="end"/>
+        <TextView android:id="@+id/w_meta1" android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:layout_marginEnd="6dp" android:text="🔥 3" android:textSize="11sp" android:textColor="#9AA0A6" android:maxLines="1"/>
+        <ImageView android:id="@+id/w_chk1" android:layout_width="34dp" android:layout_height="34dp"
+            android:padding="2dp" android:src="@mipmap/ic_launcher" android:contentDescription="Done"/>
+    </LinearLayout>
+    <LinearLayout android:id="@+id/w_row2" android:layout_width="match_parent" android:layout_height="40dp"
+        android:layout_marginTop="4dp" android:orientation="horizontal" android:gravity="center_vertical"
+        android:paddingStart="6dp" android:paddingEnd="4dp" android:background="@drawable/w_chip_dark">
+        <ImageView android:id="@+id/w_av2" android:layout_width="26dp" android:layout_height="26dp"
+            android:src="@mipmap/ic_launcher" android:importantForAccessibility="no"/>
+        <TextView android:id="@+id/w_name2" android:layout_width="0dp" android:layout_height="wrap_content"
+            android:layout_weight="1" android:layout_marginStart="8dp" android:layout_marginEnd="6dp"
+            android:text="Drink water" android:textSize="14sp" android:textColor="#ECEDF0" android:textAlignment="viewStart"
+            android:maxLines="1" android:ellipsize="end"/>
+        <TextView android:id="@+id/w_meta2" android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:layout_marginEnd="6dp" android:text="🔥 3" android:textSize="11sp" android:textColor="#9AA0A6" android:maxLines="1"/>
+        <ImageView android:id="@+id/w_chk2" android:layout_width="34dp" android:layout_height="34dp"
+            android:padding="2dp" android:src="@mipmap/ic_launcher" android:contentDescription="Done"/>
+    </LinearLayout>
+    <LinearLayout android:id="@+id/w_row3" android:layout_width="match_parent" android:layout_height="40dp"
+        android:layout_marginTop="4dp" android:orientation="horizontal" android:gravity="center_vertical"
+        android:paddingStart="6dp" android:paddingEnd="4dp" android:background="@drawable/w_chip_dark" android:visibility="gone">
+        <ImageView android:id="@+id/w_av3" android:layout_width="26dp" android:layout_height="26dp"
+            android:src="@mipmap/ic_launcher" android:importantForAccessibility="no"/>
+        <TextView android:id="@+id/w_name3" android:layout_width="0dp" android:layout_height="wrap_content"
+            android:layout_weight="1" android:layout_marginStart="8dp" android:layout_marginEnd="6dp"
+            android:text="Meditate" android:textSize="14sp" android:textColor="#ECEDF0" android:textAlignment="viewStart"
+            android:maxLines="1" android:ellipsize="end"/>
+        <TextView android:id="@+id/w_meta3" android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:layout_marginEnd="6dp" android:text="🔥 3" android:textSize="11sp" android:textColor="#9AA0A6" android:maxLines="1"/>
+        <ImageView android:id="@+id/w_chk3" android:layout_width="34dp" android:layout_height="34dp"
+            android:padding="2dp" android:src="@mipmap/ic_launcher" android:contentDescription="Done"/>
+    </LinearLayout>
+    <LinearLayout android:id="@+id/w_row4" android:layout_width="match_parent" android:layout_height="40dp"
+        android:layout_marginTop="4dp" android:orientation="horizontal" android:gravity="center_vertical"
+        android:paddingStart="6dp" android:paddingEnd="4dp" android:background="@drawable/w_chip_dark" android:visibility="gone">
+        <ImageView android:id="@+id/w_av4" android:layout_width="26dp" android:layout_height="26dp"
+            android:src="@mipmap/ic_launcher" android:importantForAccessibility="no"/>
+        <TextView android:id="@+id/w_name4" android:layout_width="0dp" android:layout_height="wrap_content"
+            android:layout_weight="1" android:layout_marginStart="8dp" android:layout_marginEnd="6dp"
+            android:text="Stretch" android:textSize="14sp" android:textColor="#ECEDF0" android:textAlignment="viewStart"
+            android:maxLines="1" android:ellipsize="end"/>
+        <TextView android:id="@+id/w_meta4" android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:layout_marginEnd="6dp" android:text="🔥 3" android:textSize="11sp" android:textColor="#9AA0A6" android:maxLines="1"/>
+        <ImageView android:id="@+id/w_chk4" android:layout_width="34dp" android:layout_height="34dp"
+            android:padding="2dp" android:src="@mipmap/ic_launcher" android:contentDescription="Done"/>
+    </LinearLayout>
+    <LinearLayout android:id="@+id/w_row5" android:layout_width="match_parent" android:layout_height="40dp"
+        android:layout_marginTop="4dp" android:orientation="horizontal" android:gravity="center_vertical"
+        android:paddingStart="6dp" android:paddingEnd="4dp" android:background="@drawable/w_chip_dark" android:visibility="gone">
+        <ImageView android:id="@+id/w_av5" android:layout_width="26dp" android:layout_height="26dp"
+            android:src="@mipmap/ic_launcher" android:importantForAccessibility="no"/>
+        <TextView android:id="@+id/w_name5" android:layout_width="0dp" android:layout_height="wrap_content"
+            android:layout_weight="1" android:layout_marginStart="8dp" android:layout_marginEnd="6dp"
+            android:text="Journal" android:textSize="14sp" android:textColor="#ECEDF0" android:textAlignment="viewStart"
+            android:maxLines="1" android:ellipsize="end"/>
+        <TextView android:id="@+id/w_meta5" android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:layout_marginEnd="6dp" android:text="🔥 3" android:textSize="11sp" android:textColor="#9AA0A6" android:maxLines="1"/>
+        <ImageView android:id="@+id/w_chk5" android:layout_width="34dp" android:layout_height="34dp"
+            android:padding="2dp" android:src="@mipmap/ic_launcher" android:contentDescription="Done"/>
+    </LinearLayout>
+    </LinearLayout>
+    <TextView android:id="@+id/w_empty" android:layout_width="match_parent" android:layout_height="match_parent"
+        android:gravity="center" android:text="Nothing due today" android:textSize="13sp"
+        android:textColor="#9AA0A6" android:visibility="gone"/>
+</LinearLayout>

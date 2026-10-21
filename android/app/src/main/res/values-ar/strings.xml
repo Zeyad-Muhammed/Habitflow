@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="wname_today">عادات اليوم</string>
+    <string name="wname_single">سلسلة عادة</string>
+    <string name="wname_ring">تقدّم اليوم</string>
+    <string name="wname_heatmap">خريطة النشاط (برو)</string>
+    <string name="wname_level">المستوى والتحدي (برو)</string>
+    <string name="wname_mood">المزاج وحكمة اليوم</string>
+
+    <string name="wdesc_today">علّم على عادات اليوم من الشاشة الرئيسية مباشرة.</string>
+    <string name="wdesc_single">عادة واحدة مع سلسلتها الحالية وزر إنجاز سريع.</string>
+    <string name="wdesc_ring">نسبة اللي خلصته من عادات النهارده.</string>
+    <string name="wdesc_heatmap">نشاطك في آخر 12 أسبوع بنظرة واحدة. برو.</string>
+    <string name="wdesc_level">مستواك ونقاط XP وتحدي اليوم. برو.</string>
+    <string name="wdesc_mood">حكمة اليوم وتسجيل المزاج بلمسة.</string>
+</resources>
