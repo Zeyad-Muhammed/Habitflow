@@ -245,6 +245,18 @@ void main() {
           name: 'F', iconIndex: 0, id: 3, frequency: 1, weekdays: [5]);
       expect(badge('perfectday').earned([daily, fridayOnly], 1, 0), isTrue);
     });
+
+    test('free plan only unlocks the free badges', () async {
+      SharedPreferences.setMockInitialValues({});
+      AuthService.isPro = false;
+      pinToday(DateTime(2026, 10, 21));
+      final month = [for (var d = 1; d <= 20; d++) DateTime(2026, 10, d)];
+      final newly = await BadgeSystem.evaluate([simpleHabit(month)], 1, 0);
+      final ids = newly.map((b) => b.id).toSet();
+      expect(ids, contains('first'));
+      expect(ids, contains('fire7'));
+      expect(ids.difference(FreePlan.badgeIds), isEmpty);
+    });
   });
 
   group('auth', () {

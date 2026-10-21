@@ -877,7 +877,7 @@ class _OnboardingPageState extends State<OnboardingPage> {
         .toList();
     final room = AuthService.isProUser
         ? pack.habits.length
-        : (3 - list.length).clamp(0, pack.habits.length);
+        : (FreePlan.maxHabits - list.length).clamp(0, pack.habits.length);
     var added = 0;
     for (final ph in pack.habits) {
       if (added >= room) break;
@@ -2816,6 +2816,21 @@ class Badge {
   Badge(this.id, this.icon, this.title, this.desc, this.earned);
 }
 
+/// What the free plan includes. Everything else is unlocked by Pro.
+class FreePlan {
+  static const maxHabits = 5;
+  static const maxMeasurable = 1;
+  static const badgeIds = {
+    'first',
+    'fire7',
+    'perfectday',
+    'first_week',
+    'first_comeback',
+  };
+  static bool badgeAvailable(String id) =>
+      AuthService.isProUser || badgeIds.contains(id);
+}
+
 class BadgeSystem {
   static List<Badge> all() => [
     Badge('first', Icons.emoji_events_outlined, t('الخطوة الأولى', 'First Step'),
@@ -2956,7 +2971,10 @@ class BadgeSystem {
       {bool awardXp = true}) async {
     final had = await unlocked();
     final newly = <Badge>[];
-    final earned = all().where((b) => b.earned(habits, level, xp)).toList();
+    final earned = all()
+        .where((b) =>
+            FreePlan.badgeAvailable(b.id) && b.earned(habits, level, xp))
+        .toList();
     for (final b in earned) {
       if (!had.contains(b.id)) newly.add(b);
     }
@@ -3277,7 +3295,6 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _loadExtras() async {
-    if (!AuthService.isProUser) return;
     final chal = ChallengeSystem.today(habits);
     final prog = await ChallengeSystem.progress(habits, chal.id);
     final claimed = await ChallengeSystem.isClaimed(dayKey(clock()));
@@ -3328,15 +3345,15 @@ class _HomePageState extends State<HomePage> {
   }
 
   void _showAddDialog() {
-    if (!AuthService.isProUser && habits.length >= 3) {
+    if (!AuthService.isProUser && habits.length >= FreePlan.maxHabits) {
       showDialog(
         context: context,
         builder: (ctx) => AlertDialog(
           backgroundColor: cardColor(Theme.of(context).brightness),
           title: Text(t('وصلت لحد الإصدار المجاني 🚧', 'You hit the free limit 🚧')),
           content: Text(t(
-              'النسخة المجانية تسمح حتى 3 عادات.\n\nرقّي إلى برو لعادات غير محدودة وبلا إعلانات والمزيد.',
-              'The free version allows up to 3 habits.\n\nUpgrade to Pro for unlimited habits, no ads and more.')),
+              'النسخة المجانية تسمح حتى ${FreePlan.maxHabits} عادات.\n\nرقّي إلى برو لعادات غير محدودة وبلا إعلانات والمزيد.',
+              'The free version allows up to ${FreePlan.maxHabits} habits.\n\nUpgrade to Pro for unlimited habits, no ads and more.')),
           actions: [
             TextButton(
               onPressed: () => Navigator.pop(ctx),
@@ -3355,7 +3372,9 @@ class _HomePageState extends State<HomePage> {
       );
       return;
     }
-    showHabitDialog(context, onSave: (habit) {
+    showHabitDialog(context,
+        measurableInUse: habits.where((h) => h.isMeasurable).length,
+        onSave: (habit) {
       _addHabit(habit);
     });
   }
@@ -3451,13 +3470,6 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _recordAmount(Habit habit) async {
-    if (!AuthService.isProUser) {
-      showProUpgrade(context,
-          message: t(
-              'تسجيل التقدم في العادات القابلة للقياس من مميزات برو.',
-              'Logging progress on measurable habits is a Pro feature.'));
-      return;
-    }
     final now = clock();
     final today = dayKey(now);
     final recorded = habit.amountOn(now);
@@ -3566,7 +3578,6 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _award(Habit habit) async {
-    if (!AuthService.isProUser) return;
     const streakBonus = {7: 50, 30: 150, 100: 500, 365: 2000};
     final streak = habit.currentStreak();
     final bonus = streakBonus[streak] ?? 0;
@@ -3616,7 +3627,6 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _checkMilestones() async {
-    if (!AuthService.isProUser) return;
     final newly =
         await BadgeSystem.evaluate(habits, _level, _xp, awardXp: false);
     for (final _ in newly) {
@@ -3626,7 +3636,11 @@ class _HomePageState extends State<HomePage> {
     await _loadExtras();
     final challenge = ChallengeSystem.today(habits);
     final res = await ChallengeSystem.maybeComplete(
-        habits, challenge.id, challenge.target, challenge.xp);
+        habits,
+        challenge.id,
+        challenge.target,
+        // Pro doubles the daily challenge reward.
+        AuthService.isProUser ? challenge.xp * 2 : challenge.xp);
     if (res.done) await _loadExtras();
     if (!mounted) return;
     if (newly.isNotEmpty) _showBadgeUnlocked(newly);
@@ -3956,7 +3970,7 @@ child: Text(t('رائع!', 'Awesome!')),
               ),
             ),
             const SizedBox(height: 16),
-            if (AuthService.isProUser) ...[
+            ...[
               Container(
                 padding: const EdgeInsets.symmetric(
                     horizontal: 16, vertical: 12),
@@ -4151,7 +4165,7 @@ if (_moodStreak >= 2)
                 ),
               ),
               const SizedBox(height: 12),
-              if (_insights.isNotEmpty)
+              if (AuthService.isProUser && _insights.isNotEmpty)
                 Container(
                   padding: const EdgeInsets.all(16),
                   decoration: BoxDecoration(
@@ -4410,8 +4424,7 @@ child: Material(
                               padding: const EdgeInsets.only(top: 4),
                               child: Row(
                                 children: [
-                                  if (AuthService.isProUser &&
-                                      streak > 0) ...[
+                                  if (streak > 0) ...[
                                     if (done) ...[
                                       Icon(
                                           Icons.local_fire_department,
@@ -4463,8 +4476,7 @@ child: Material(
                                       const SizedBox(width: 8),
                                     ],
                                   ],
-                                  if (AuthService.isProUser &&
-                                      !done &&
+                                  if (!done &&
                                       streak == 0 &&
                                       habit.longestStreak() > 0) ...[
                                     Container(
@@ -4530,8 +4542,7 @@ child: Material(
                                   if (habit.isQuit &&
                                       !habit.isMeasurable)
                                     Text(
-                                        (AuthService.isProUser &&
-                                                streak > 0)
+                                        streak > 0
                                             ? '🍃 ${t('أنظف', 'Clean')} · ${daysLabel(streak)}'
                                             : t('حافظ على نظافتها',
                                                 'Keep it clean'),
@@ -4707,9 +4718,6 @@ child: Material(
           ),
         ),
       ),
-      bottomNavigationBar: AuthService.isProUser
-          ? null
-          : const AdBannerWidget(),
     );
   }
 }
@@ -5100,29 +5108,26 @@ class _ProPageState extends State<ProPage> {
     final primary = Theme.of(context).colorScheme.primary;
     final brightness = Theme.of(context).brightness;
 
-    // Keep this list in sync with the AuthService.isProUser checks.
+    // Keep this list in sync with FreePlan and the AuthService.isProUser checks.
     final features = [
-      (Icons.block, t('بلا إعلانات', 'No ads'),
-          t('إزالة إعلان الشاشة الرئيسية', 'Remove the banner ad on the home screen')),
       (Icons.all_inclusive, t('عادات غير محدودة', 'Unlimited habits'),
-          t('المجاني حتى 3 عادات — برو بلا حد', 'Free allows 3 habits — Pro has no limit')),
-      (Icons.straighten, t('عادات قابلة للقياس ومؤقت', 'Measurable & timer habits'),
-          t('أهداف بوحدات (صفحات، دقائق…) وعدّاد تنازلي',
-              'Goals with units (pages, minutes…) and a countdown timer')),
-      (Icons.notifications_active, t('تذكير لكل عادة', 'Per-habit reminders'),
-          t('تذكير يومي بوقت خاص لكل عادة', 'A daily reminder at its own time for each habit')),
-      (Icons.emoji_events, t('مستويات وشارات وتحديات', 'Levels, badges & challenges'),
-          t('نقاط XP، تحدي يومي، تسجيل المزاج ورؤى ذكية',
-              'XP, a daily challenge, mood check-ins and smart insights')),
+          t('المجاني حتى ${FreePlan.maxHabits} عادات، وبرو من غير حد',
+              'Free allows ${FreePlan.maxHabits} habits, Pro has no limit')),
+      (Icons.block, t('بلا إعلانات', 'No ads'),
+          t('إزالة الإعلان من الإحصائيات والإعدادات',
+              'Remove the banner from Stats and Settings')),
       (Icons.insights, t('تحليلات متقدمة', 'Advanced analytics'),
-          t('ملخص الأسبوع، الرسوم البيانية، خرائط النشاط والإنجازات',
-              'Weekly recap, charts, activity heatmaps and achievements')),
+          t('آخر 12 شهراً، خرائط النشاط، أفضل يوم، ورؤى ذكية',
+              'Last 12 months, activity heatmaps, best day and smart insights')),
+      (Icons.straighten, t('قياس ومؤقت بلا حد', 'Unlimited measurable & timer habits'),
+          t('المجاني عادة واحدة قابلة للقياس، وبرو بلا حد، ومعاها العدّاد التنازلي',
+              'Free includes one measurable habit; Pro removes the limit and adds the countdown timer')),
+      (Icons.emoji_events, t('كل الشارات و XP مضاعف', 'All badges & double challenge XP'),
+          t('${FreePlan.badgeIds.length} شارات في المجاني، وكل الشارات في برو، ومكافأة التحدي اليومي مضاعفة',
+              '${FreePlan.badgeIds.length} badges on Free, all of them on Pro, and double daily-challenge XP')),
       (Icons.palette, t('تخصيص كامل', 'Full customisation'),
           t('مكتبة الأيقونات الكاملة ولون مخصص للتطبيق',
               'The full icon library and a custom app colour')),
-      (Icons.cloud_done, t('نسخ احتياطي واستعادة', 'Backup & restore'),
-          t('صدّر بياناتك لملف واستعدها في أي وقت',
-              'Export your data to a file and restore it anytime')),
     ];
 
     return Scaffold(
@@ -5349,8 +5354,14 @@ void showProUpgrade(
 Future<void> showHabitDialog(
   BuildContext context, {
   Habit? existing,
+  // How many measurable habits the user already has. Callers that don't know
+  // pass the free limit, so a free user can't convert a habit from there.
+  int measurableInUse = FreePlan.maxMeasurable,
   required void Function(Habit habit) onSave,
 }) {
+  final canAddMeasurable = AuthService.isProUser ||
+      (existing?.isMeasurable ?? false) ||
+      measurableInUse < FreePlan.maxMeasurable;
   final controller = TextEditingController(text: existing?.name ?? '');
   final targetController = TextEditingController(
       text: existing != null && existing.target > 0
@@ -5635,18 +5646,18 @@ Future<void> showHabitDialog(
                   Expanded(
                       child: Text(t('قابلة للقياس (هدف ووحدة)',
                           'Measurable (goal & unit)'))),
-                  if (!AuthService.isProUser)
+                  if (!canAddMeasurable)
                     const Icon(Icons.lock, size: 15, color: Colors.grey),
                 ]),
                 subtitle: Text(t('مثال: صفحات، دقائق، أكواب ماء',
                     'Example: pages, minutes, cups of water')),
                 value: measurable,
                 onChanged: (v) {
-                  if (v && !AuthService.isProUser) {
+                  if (v && !canAddMeasurable) {
                     showProUpgrade(ctx,
                         message: t(
-                            'العادات القابلة للقياس (أهداف ووحدات مثل الصفحات والدقائق…) من مميزات برو.',
-                            'Measurable habits (goals and units like pages, minutes…) are a Pro feature.'));
+                            'النسخة المجانية فيها عادة واحدة قابلة للقياس. برو بيفتحها بلا حد.',
+                            'The free plan includes one measurable habit. Pro unlocks unlimited ones.'));
                     return;
                   }
                   setDialogState(() => measurable = v);
@@ -5778,8 +5789,6 @@ Future<void> showHabitDialog(
                 contentPadding: EdgeInsets.zero,
                 title: Row(children: [
                   Expanded(child: Text(t('ذكّرني', 'Remind me'))),
-                  if (!AuthService.isProUser)
-                    const Icon(Icons.lock, size: 15, color: Colors.grey),
                 ]),
                 subtitle: Text(reminderOn
                     ? t('في ${reminderTime.format(context)}',
@@ -5788,13 +5797,6 @@ Future<void> showHabitDialog(
                         'Set a daily reminder for this habit')),
                 value: reminderOn,
                 onChanged: (v) async {
-                  if (v && !AuthService.isProUser) {
-                    showProUpgrade(ctx,
-                        message: t(
-                            'التذكير اليومي للعادة من مميزات برو.',
-                            'Daily habit reminders are a Pro feature.'));
-                    return;
-                  }
                   if (v) {
                     final picked = await showTimePicker(
                       context: context,
@@ -6639,10 +6641,16 @@ class _StatsPageState extends State<StatsPage> {
 
     final achievements = BadgeSystem.all().map((b) {
       final earned = b.earned(habits, _level, _xp);
-      return (b.icon, b.title, b.desc, earned && unlocked.contains(b.id));
+      final desc = FreePlan.badgeAvailable(b.id)
+          ? b.desc
+          : t('متاحة في برو 🔒', 'Available in Pro 🔒');
+      return (b.icon, b.title, desc, earned && unlocked.contains(b.id));
     }).toList();
 
     return Scaffold(
+      // Free plan: a small banner here and in Settings, never on Home.
+      bottomNavigationBar:
+          AuthService.isProUser ? null : const AdBannerWidget(),
       appBar: AppBar(
         title: Text(t('إحصائياتك', 'Your stats')),
         backgroundColor: Colors.transparent,
@@ -6722,11 +6730,7 @@ class _StatsPageState extends State<StatsPage> {
             ],
           ),
 
-          _ProSection(
-            title: t('التحليلات المتقدمة (أسبوعي وشهري) 📊', 'Advanced analytics (weekly & monthly) 📊'),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [          const SizedBox(height: 24),
+          const SizedBox(height: 24),
           Container(
             padding: const EdgeInsets.all(18),
             decoration: BoxDecoration(
@@ -6868,6 +6872,12 @@ class _StatsPageState extends State<StatsPage> {
             style: TextStyle(color: Colors.grey.shade500, fontSize: 13),
           ),
           const SizedBox(height: 24),
+          _ProSection(
+            title: t('التحليلات المتقدمة (شهري وسنوي) 📊',
+                'Advanced analytics (monthly & yearly) 📊'),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
           Text(t('آخر 12 شهراً 📈', 'Last 12 months 📈'),
               style:
                   const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
@@ -7088,6 +7098,9 @@ class _StatsPageState extends State<StatsPage> {
               ],
             ),
           ),
+              ],
+            ),
+          ),
           const SizedBox(height: 24),
           Text(t('تفصيل العادات 📊', 'Habit breakdown 📊'),
               style:
@@ -7220,10 +7233,6 @@ class _StatsPageState extends State<StatsPage> {
                   ),
                 );
               },
-            ),
-          ),
-
-              ],
             ),
           ),
         ],
@@ -7657,15 +7666,6 @@ class _SettingsPageState extends State<SettingsPage> {
   }
 
   Future<void> _exportBackup() async {
-    if (!AuthService.isProUser) {
-      if (mounted) {
-        showProUpgrade(context,
-            message: t(
-                'عمل نسخة احتياطية كاملة بالملفات 🔒 من مميزات برو.',
-                'Full file-based backup 🔒 is a Pro feature.'));
-      }
-      return;
-    }
     try {
       final prefs = await SharedPreferences.getInstance();
       final email = AuthService.email;
@@ -7727,15 +7727,6 @@ class _SettingsPageState extends State<SettingsPage> {
   }
 
   Future<void> _restoreBackup() async {
-    if (!AuthService.isProUser) {
-      if (mounted) {
-        showProUpgrade(context,
-            message: t(
-                'استعادة نسخة احتياطية بالملفات 🔒 من مميزات برو.',
-                'Restoring from a file 🔒 is a Pro feature.'));
-      }
-      return;
-    }
     final res = await FilePicker.platform.pickFiles(
       type: FileType.custom,
       allowedExtensions: ['json'],
@@ -7861,6 +7852,9 @@ class _SettingsPageState extends State<SettingsPage> {
     final brightness = Theme.of(context).brightness;
 
     return Scaffold(
+      // Free plan: a small banner here and in Settings, never on Home.
+      bottomNavigationBar:
+          AuthService.isProUser ? null : const AdBannerWidget(),
       appBar: AppBar(
         title: Text(t('الإعدادات', 'Settings')),
         backgroundColor: Colors.transparent,
