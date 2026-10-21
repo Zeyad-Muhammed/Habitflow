@@ -4164,7 +4164,10 @@ if (_moodStreak >= 2)
                   ],
                 ),
               ),
-              const SizedBox(height: 12),
+              // Insights are Pro-only; skip their spacing too so Free has no
+              // doubled gap before the quote card.
+              if (AuthService.isProUser && _insights.isNotEmpty)
+                const SizedBox(height: 12),
               if (AuthService.isProUser && _insights.isNotEmpty)
                 Container(
                   padding: const EdgeInsets.all(16),
@@ -7871,8 +7874,15 @@ if (!AuthService.isProUser)
               margin: const EdgeInsets.only(bottom: 16),
               padding: const EdgeInsets.all(16),
               decoration: BoxDecoration(
+                // Darken the pastel dark-mode primary so the white text on
+                // this banner stays readable (same as the Pro page hero).
                 gradient: LinearGradient(
-                  colors: [primary, primary.withAlpha(180)],
+                  colors: brightness == Brightness.dark
+                      ? [
+                          Color.lerp(primary, Colors.black, 0.45)!,
+                          Color.lerp(primary, Colors.black, 0.25)!,
+                        ]
+                      : [primary, primary.withAlpha(180)],
                 ),
                 borderRadius: BorderRadius.circular(16),
               ),
@@ -7905,7 +7915,13 @@ else if (AuthService.isProUser)
               padding: const EdgeInsets.all(16),
               decoration: BoxDecoration(
                 gradient: LinearGradient(
-                  colors: [Colors.green.shade700, primary],
+                  // Darkened in dark mode so the white text stays readable.
+                  colors: [
+                    Colors.green.shade700,
+                    brightness == Brightness.dark
+                        ? Color.lerp(primary, Colors.black, 0.35)!
+                        : primary,
+                  ],
                 ),
                 borderRadius: BorderRadius.circular(16),
               ),
