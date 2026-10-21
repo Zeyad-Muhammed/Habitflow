@@ -4897,7 +4897,12 @@ class _NavItem extends StatelessWidget {
         onTap: onTap,
         child: AnimatedContainer(
           duration: const Duration(milliseconds: 300),
-          curve: Curves.easeOutBack,
+          // Must not overshoot: decoration tweens are only valid for t in
+          // [0, 1]. easeOutBack pushed t past 1 while a tab was being
+          // deselected, scaling the shadow blur negative and throwing
+          // ("Text shadow blur radius should be non-negative"), which
+          // flashed a red error widget in the nav bar on every tab switch.
+          curve: Curves.easeOutCubic,
           height: 58,
           alignment: Alignment.center,
           padding: const EdgeInsets.symmetric(horizontal: 14),
