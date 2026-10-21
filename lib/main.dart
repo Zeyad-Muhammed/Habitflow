@@ -379,12 +379,14 @@ class BillingService {
 
   // Play can leave these calls pending forever (seen on an emulator whose
   // billing service never answered), which kept the paywall on "Loading…"
-  // and the buy button spinning. Time out and treat it as unavailable.
+  // and the buy button spinning. User-facing calls time out and treat the
+  // store as unavailable; the silent startup refresh just waits.
   static const _storeTimeout = Duration(seconds: 10);
 
-  Future<bool> available() async {
+  Future<bool> available({bool timeout = false}) async {
     try {
-      return await _iap.isAvailable().timeout(_storeTimeout);
+      final f = _iap.isAvailable();
+      return await (timeout ? f.timeout(_storeTimeout) : f);
     } catch (_) {
       return false;
     }
@@ -429,7 +431,7 @@ class BillingService {
 
   Future<BillingOutcome> buy(ProPlan plan) async {
     try {
-      if (!await available()) { return BillingOutcome.unavailable; }
+      if (!await available(timeout: true)) { return BillingOutcome.unavailable; }
       await ensureProducts();
       final details = plan == ProPlan.yearly
           ? (_yearlyTrial ?? _plans[ProPlan.yearly])
@@ -456,7 +458,7 @@ class BillingService {
 
   Future<BillingOutcome> restore() async {
     try {
-      if (!await available()) { return BillingOutcome.unavailable; }
+      if (!await available(timeout: true)) { return BillingOutcome.unavailable; }
       _sawActivePro = AuthService.isProUser;
       await _iap.restorePurchases();
       await Future<void>.delayed(const Duration(seconds: 6));
