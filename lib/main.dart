@@ -336,16 +336,29 @@ class SocialAuth {
   }
 }
 
+enum ProPlan { monthly, yearly, lifetime }
+
 /// Wraps Google Play Billing through the in_app_purchase plugin.
-/// Grants Pro on active purchases; monthly renewal is managed by Google Play.
+/// Grants Pro on active purchases; renewals are managed by Google Play.
 class BillingService {
   static const String proMonthlyId = 'com.novustudio.habitflow.pro_monthly';
+  static const String proYearlyId = 'com.novustudio.habitflow.pro_yearly';
+  static const String proLifetimeId = 'com.novustudio.habitflow.pro_lifetime';
+  static const productIds = {proMonthlyId, proYearlyId, proLifetimeId};
+
+  static ProPlan? planFor(String productId) => switch (productId) {
+        proMonthlyId => ProPlan.monthly,
+        proYearlyId => ProPlan.yearly,
+        proLifetimeId => ProPlan.lifetime,
+        _ => null,
+      };
 
   static BillingService? _instance;
   static BillingService get instance => _instance ??= BillingService._();
 
   final InAppPurchase _iap;
-  ProductDetails? _pro;
+  final Map<ProPlan, ProductDetails> _plans = {};
+  ProductDetails? _yearlyTrial;
   String? _lastError;
   Completer<BillingOutcome>? _outcome;
   bool _sawActivePro = false;
@@ -358,36 +371,59 @@ class BillingService {
     });
   }
 
-  ProductDetails? get proProduct => _pro;
+  ProductDetails? product(ProPlan plan) => _plans[plan];
+
+  /// Set only while Play still offers this user the yearly free trial.
+  bool get hasYearlyTrial => _yearlyTrial != null;
   String? get lastError => _lastError;
 
   Future<bool> available() async {
     try { return await _iap.isAvailable(); } catch (_) { return false; }
   }
 
-  Future<void> ensureProduct() async {
+  Future<void> ensureProducts() async {
     try {
-      final res = await _iap.queryProductDetails({proMonthlyId});
+      final res = await _iap.queryProductDetails(productIds);
+      _plans.clear();
+      _yearlyTrial = null;
+      // A subscription comes back once per base plan and once per offer. The
+      // free-trial offer is the one whose first pricing phase costs nothing.
       for (final p in res.productDetails) {
-        if (p.id == proMonthlyId) { _pro = p; break; }
+        if (p.id == proYearlyId && p.rawPrice == 0) {
+          _yearlyTrial = p;
+          continue;
+        }
+        final plan = planFor(p.id);
+        if (plan != null) _plans.putIfAbsent(plan, () => p);
       }
     } catch (e) { _lastError = '$e'; }
+  }
+
+  /// Whole-percent saving of the yearly plan over twelve monthly payments.
+  int? get yearlySavingPercent {
+    final m = _plans[ProPlan.monthly]?.rawPrice;
+    final y = _plans[ProPlan.yearly]?.rawPrice;
+    if (m == null || y == null || m <= 0) return null;
+    final pct = ((1 - y / (m * 12)) * 100).round();
+    return pct > 0 ? pct : null;
   }
 
   /// Grant pro when a monthly subscription is or was active.
   Future<void> refreshSubscription() async {
     try {
       if (!await available()) return;
-      await ensureProduct();
+      await ensureProducts();
       await _iap.restorePurchases();
     } catch (e) { _lastError = '$e'; }
   }
 
-  Future<BillingOutcome> buyPro() async {
+  Future<BillingOutcome> buy(ProPlan plan) async {
     try {
       if (!await available()) { return BillingOutcome.unavailable; }
-      await ensureProduct();
-      final details = _pro;
+      await ensureProducts();
+      final details = plan == ProPlan.yearly
+          ? (_yearlyTrial ?? _plans[ProPlan.yearly])
+          : _plans[plan];
       if (details == null) { return BillingOutcome.noProduct; }
       final completer = Completer<BillingOutcome>();
       _outcome = completer;
@@ -434,7 +470,7 @@ class BillingService {
         continue;
       }
       if (d.status == PurchaseStatus.restored || d.status == PurchaseStatus.purchased) {
-        if (d.productID == proMonthlyId) {
+        if (productIds.contains(d.productID)) {
           _sawActivePro = true;
           _grantPro(d);
         }
@@ -4984,9 +5020,11 @@ class ProPage extends StatefulWidget {
 }
 
 class _ProPageState extends State<ProPage> {
-  ProductDetails? _pro;
+  ProPlan _selected = ProPlan.yearly;
   bool _loading = true;
   bool _busy = false;
+
+  ProductDetails? get _pro => BillingService.instance.product(_selected);
 
   @override
   void initState() {
@@ -4995,19 +5033,14 @@ class _ProPageState extends State<ProPage> {
   }
 
   Future<void> _load() async {
-    await BillingService.instance.ensureProduct();
-    if (mounted) {
-      setState(() {
-        _pro = BillingService.instance.proProduct;
-        _loading = false;
-      });
-    }
+    await BillingService.instance.ensureProducts();
+    if (mounted) setState(() => _loading = false);
   }
 
   Future<void> _buy() async {
     if (_busy) { return; }
     setState(() => _busy = true);
-    final outcome = await BillingService.instance.buyPro();
+    final outcome = await BillingService.instance.buy(_selected);
     if (!mounted) { return; }
     setState(() => _busy = false);
     switch (outcome) {
@@ -5049,8 +5082,8 @@ class _ProPageState extends State<ProPage> {
     if (outcome == BillingOutcome.granted) {
       _welcomeDialog();
     } else {
-      _snack(t('لا يوجد اشتراك فعّال قابل للاستعادة.',
-          'No active subscription to restore.'));
+      _snack(t('لا يوجد اشتراك أو شراء فعّال قابل للاستعادة.',
+          'No active subscription or purchase to restore.'));
     }
   }
 
@@ -5093,8 +5126,8 @@ class _ProPageState extends State<ProPage> {
         backgroundColor: cardColor(Theme.of(ctx).brightness),
         title: const Text('HabitFlow Pro'),
         content: Text(t(
-            'أهلاً بك في برو! جميع ميزات برو مفعّلة الآن، والاشتراك الشهري يجدّد تلقائياً عبر Google Play.',
-            'Welcome to Pro! All Pro features are enabled. Your monthly subscription renews automatically through Google Play.')),
+            'أهلاً بك في برو! جميع ميزات برو مفعّلة الآن.',
+            'Welcome to Pro! All Pro features are now enabled.')),
         actions: [
           FilledButton(
             onPressed: () => Navigator.pop(ctx),
@@ -5222,20 +5255,17 @@ class _ProPageState extends State<ProPage> {
                 const Text('HabitFlow Pro',
                     style:
                         TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
-                const SizedBox(height: 4),
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  crossAxisAlignment: CrossAxisAlignment.baseline,
-                  textBaseline: TextBaseline.alphabetic,
-                  children: [
-                    Text(_pro?.price ?? t('—', '—'),
-                        style: const TextStyle(
-                            fontSize: 40, fontWeight: FontWeight.bold)),
-                    Text(t(' /شهر', '/month'),
-                        style:
-                            const TextStyle(fontSize: 16, color: Colors.grey)),
-                  ],
-                ),
+                if (!AuthService.isProUser) ...[
+                  const SizedBox(height: 14),
+                  for (final plan in ProPlan.values)
+                    _PlanTile(
+                      plan: plan,
+                      selected: plan == _selected,
+                      onTap: _busy
+                          ? null
+                          : () => setState(() => _selected = plan),
+                    ),
+                ],
                 const SizedBox(height: 16),
                 if (AuthService.isProUser)
                   Column(
@@ -5276,10 +5306,18 @@ class _ProPageState extends State<ProPage> {
                                 child: CircularProgressIndicator(
                                     strokeWidth: 2.5, color: Colors.white))
                             : Text(
-                                _pro != null
-                                    ? t('اشترك الآن', 'Subscribe now')
-                                    : t('التفاصيل عند فتح Play…',
-                                        'Loading store details…'),
+                                _pro == null
+                                    ? t('التفاصيل عند فتح Play…',
+                                        'Loading store details…')
+                                    : switch (_selected) {
+                                        ProPlan.yearly when BillingService
+                                                .instance.hasYearlyTrial =>
+                                          t('ابدأ 7 أيام مجاناً',
+                                              'Start 7-day free trial'),
+                                        ProPlan.lifetime => t(
+                                            'اشترِ مرة واحدة', 'Buy once'),
+                                        _ => t('اشترك الآن', 'Subscribe now'),
+                                      },
                                 style: const TextStyle(fontSize: 16)),
                       ),
                     ),
@@ -5292,13 +5330,16 @@ class _ProPageState extends State<ProPage> {
             width: double.infinity,
             child: OutlinedButton(
               onPressed: _busy ? null : _restore,
-              child: Text(t('استعادة الاشتراك', 'Restore purchase')),
+              child: Text(t('استعادة المشتريات', 'Restore purchases')),
             ),
           ),
           const SizedBox(height: 10),
           Text(
-            t('اشتراك شهري يجدّد تلقائياً عبر Google Play. يمكنك الإلغاء من متجر Play في أي وقت.',
-                'Monthly subscription, auto-renewed by Google Play. Cancel anytime from the Play Store.'),
+            _selected == ProPlan.lifetime
+                ? t('دفعة واحدة عبر Google Play، من غير تجديد.',
+                    'One payment through Google Play, no renewal.')
+                : t('اشتراك يجدّد تلقائياً عبر Google Play. يمكنك الإلغاء من متجر Play في أي وقت.',
+                    'Auto-renewing subscription through Google Play. Cancel anytime from the Play Store.'),
             textAlign: TextAlign.center,
             style: TextStyle(color: Colors.grey.shade600, fontSize: 12),
           ),
@@ -5313,6 +5354,123 @@ class _ProPageState extends State<ProPage> {
               ),
             ),
         ],
+      ),
+    );
+  }
+}
+
+class _PlanTile extends StatelessWidget {
+  const _PlanTile({
+    required this.plan,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final ProPlan plan;
+  final bool selected;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final billing = BillingService.instance;
+    final price = billing.product(plan)?.price ?? '—';
+    final title = switch (plan) {
+      ProPlan.monthly => t('شهري', 'Monthly'),
+      ProPlan.yearly => t('سنوي', 'Yearly'),
+      ProPlan.lifetime => t('مدى الحياة', 'Lifetime'),
+    };
+    final period = switch (plan) {
+      ProPlan.monthly => t('/شهر', '/month'),
+      ProPlan.yearly => t('/سنة', '/year'),
+      ProPlan.lifetime => t('مرة واحدة', 'one time'),
+    };
+    final saving = billing.yearlySavingPercent;
+    final tags = <String>[
+      if (plan == ProPlan.yearly) ...[
+        if (saving != null)
+          t('الأوفر · وفّر ${ltr('$saving%')}', 'Best value · save $saving%')
+        else
+          t('الأوفر', 'Best value'),
+        if (billing.hasYearlyTrial) t('7 أيام مجاناً', '7 days free'),
+      ],
+    ];
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: Material(
+        color: selected ? scheme.primary.withAlpha(30) : Colors.transparent,
+        borderRadius: BorderRadius.circular(14),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(14),
+          onTap: onTap,
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(
+                color: selected ? scheme.primary : scheme.outlineVariant,
+                width: selected ? 2 : 1,
+              ),
+            ),
+            child: Row(
+              children: [
+                Icon(
+                  selected
+                      ? Icons.radio_button_checked
+                      : Icons.radio_button_unchecked,
+                  color: selected ? scheme.primary : scheme.outline,
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(title,
+                          style: const TextStyle(
+                              fontSize: 16, fontWeight: FontWeight.bold)),
+                      if (tags.isNotEmpty)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 4),
+                          child: Wrap(
+                            spacing: 6,
+                            runSpacing: 4,
+                            children: [
+                              for (final tag in tags)
+                                Container(
+                                  padding: const EdgeInsets.symmetric(
+                                      horizontal: 8, vertical: 2),
+                                  decoration: BoxDecoration(
+                                    color: scheme.primary,
+                                    borderRadius: BorderRadius.circular(20),
+                                  ),
+                                  child: Text(tag,
+                                      style: TextStyle(
+                                          fontSize: 11,
+                                          fontWeight: FontWeight.bold,
+                                          color: scheme.onPrimary)),
+                                ),
+                            ],
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    Text(price,
+                        style: const TextStyle(
+                            fontSize: 17, fontWeight: FontWeight.w800)),
+                    Text(period,
+                        style: TextStyle(
+                            fontSize: 12, color: scheme.onSurfaceVariant)),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ),
       ),
     );
   }
