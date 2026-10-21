@@ -61,4 +61,10 @@ void main() {
     });
     expect(find.byType(MainShell), findsOneWidget);
   });
+
+  testWidgets('Arabic layout is right-to-left', (WidgetTester tester) async {
+    await launchApp(tester, prefs: {'onboarding_done': true}, lang: 'ar');
+    final ctx = tester.element(find.byType(Scaffold).first);
+    expect(Directionality.of(ctx), TextDirection.rtl);
+  });
 }

@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
+import 'dart:ui' show DartPluginRegistrant;
 
 import 'package:crypto/crypto.dart';
 import 'package:file_picker/file_picker.dart';
@@ -83,6 +84,10 @@ class AuthService {
   // Production builds omit the define, so this stays false.
   static const bool forceProTest = bool.fromEnvironment('FORCE_PRO');
 
+  static const minPasswordLength = 6;
+
+  static bool isValidEmail(String email) =>
+      RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(email.trim());
   static bool get isProUser => isPro || forceProTest;
 
   static String _hash(String password) =>
@@ -186,7 +191,7 @@ class AuthService {
       _resetCode != null && code.trim() == _resetCode;
 
   static Future<bool> completePasswordReset(String newPassword) async {
-    if (newPassword.length < 4) return false;
+    if (newPassword.length < minPasswordLength) return false;
     final prefs = await SharedPreferences.getInstance();
     if (prefs.getString('auth_hash') == null) return false;
     await prefs.setString('auth_hash', _hash(newPassword));
@@ -449,6 +454,9 @@ class BillingService {
     if (c != null && !c.isCompleted) { c.complete(outcome); }
   }
 }
+
+/// Current time source. Tests override this to pin "today".
+DateTime Function() clock = DateTime.now;
 
 String dayKey(DateTime d) =>
     '${d.year}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
@@ -1248,10 +1256,15 @@ class _AuthPageState extends State<AuthPage> {
   Future<void> _submit() async {
     final emailText = _email.text.trim();
     final passText = _password.text;
-    if (emailText.isEmpty || passText.length < 4) {
+    // New passwords need 6+ characters; sign-in only needs one, so accounts
+    // created under the old 4-character rule can still log in.
+    final passTooShort = _isSignup
+        ? passText.length < AuthService.minPasswordLength
+        : passText.isEmpty;
+    if (!AuthService.isValidEmail(emailText) || passTooShort) {
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text(t('أدخل بريدك وكلمة مرور (4 حروف فأكثر)',
-              'Enter your email and a password (4+ characters)'))));
+          content: Text(t('أدخل بريداً صحيحاً وكلمة مرور (6 حروف فأكثر)',
+              'Enter a valid email and a password (6+ characters)'))));
       return;
     }
     setState(() => _loading = true);
@@ -1695,8 +1708,8 @@ class _ResetPasswordPageState extends State<ResetPasswordPage> {
 
   Future<void> _saveNewPassword() async {
     final pass = _newPass.text;
-    if (pass.length < 4) {
-      _toast(t('الباسورد لازم 4 حروف فأكثر', 'Password must be 4+ characters'));
+    if (pass.length < AuthService.minPasswordLength) {
+      _toast(t('الباسورد لازم 6 حروف فأكثر', 'Password must be 6+ characters'));
       return;
     }
     if (pass != _confirm.text) {
@@ -1871,10 +1884,18 @@ class _ResetPasswordPageState extends State<ResetPasswordPage> {
   }
 }
 
+@pragma('vm:entry-point')
+Future<void> notificationBackgroundHandler(NotificationResponse response) async {
+  DartPluginRegistrant.ensureInitialized();
+  await NotificationService.handleResponse(response);
+}
+
 const MethodChannel _widgetChannel = MethodChannel('com.novu.HabitFlow/widget');
 
 void refreshWidget() {
-  _widgetChannel.invokeMethod('refresh');
+  // The channel only exists on Android while the activity is running (not in
+  // tests, other platforms or the background notification isolate).
+  _widgetChannel.invokeMethod('refresh').catchError((_) => null);
 }
 
 class NotificationService {
@@ -1893,6 +1914,10 @@ class NotificationService {
     await _plugin.initialize(
       settings: settings,
       onDidReceiveNotificationResponse: _onNotificationResponse,
+      // "Done ✔" has showsUserInterface: false, so when the app isn't in the
+      // foreground Android delivers it to this background entry point only.
+      onDidReceiveBackgroundNotificationResponse:
+          notificationBackgroundHandler,
     );
     _initialized = true;
   }
@@ -1948,6 +1973,9 @@ class NotificationService {
     }
   }
 
+  static Future<void> handleResponse(NotificationResponse response) =>
+      _onNotificationResponse(response);
+
   static Future<void> _completeHabitById(int id) async {
     try {
       final prefs = await SharedPreferences.getInstance();
@@ -1958,7 +1986,7 @@ class NotificationService {
       final idx = list.indexWhere((h) => h.id == id);
       if (idx < 0) return;
       final h = list[idx];
-      final now = DateTime.now();
+      final now = clock();
       if (!h.isDueOn(now) || h.isDoneOn(now)) return;
       if (h.isMeasurable) {
         h.amounts[dayKey(now)] = h.target;
@@ -2088,7 +2116,7 @@ class Habit {
     this.timerMinutes = 5,
     Map<String, double>? amounts,
     Map<String, String>? doneAt,
-  })  : id = id ?? (DateTime.now().millisecondsSinceEpoch & 0x1FFFFFFF),
+  })  : id = id ?? (clock().millisecondsSinceEpoch & 0x1FFFFFFF),
         completedDates = completedDates ?? [],
         weekdays = weekdays ?? [1, 2, 3, 4, 5, 6, 7],
         amounts = amounts ?? {},
@@ -2187,7 +2215,8 @@ class Habit {
     ...extraIcons,
   ];
 
-  IconData get icon => availableIcons[iconIndex];
+  IconData get icon =>
+      availableIcons[iconIndex.clamp(0, availableIcons.length - 1)];
 
   bool get isMeasurable => target > 0;
   bool get isTimerHabit => isTimer;
@@ -2196,7 +2225,9 @@ class Habit {
   bool get isDaily => frequency == 0;
 
   bool isDueOn(DateTime d) {
-    if (isWeekly && (weekdays.isEmpty || weekdays.length < 7)) {
+    // A weekly habit with no days selected would never be due, which made
+    // currentStreak() loop forever. Treat it as daily instead.
+    if (isWeekly && weekdays.isNotEmpty && weekdays.length < 7) {
       return weekdays.contains(d.weekday);
     }
     return true;
@@ -2235,40 +2266,42 @@ class Habit {
         all.add(parseDayKey(k));
       } catch (_) {}
     }
-    if (all.isEmpty) return DateTime.now();
+    if (all.isEmpty) {
+      final now = clock();
+      return DateTime(now.year, now.month, now.day);
+    }
     return all.reduce((a, b) => a.isBefore(b) ? a : b);
   }
 
   static DateTime mondayOf(DateTime d) {
     final diff = (d.weekday - DateTime.monday) % 7;
-    return addDays(d, -diff);
+    return addDays(DateTime(d.year, d.month, d.day), -diff);
   }
 
   int currentStreak() {
     if (isFlexible) return _flexibleStreak();
     int streak = 0;
-    var day = DateTime.now();
-    if (!isDueOn(day)) {
-      day = addDays(day, -1);
-    }
-    while (true) {
+    final now = clock();
+    final earliest = _earliest();
+    var day = DateTime(now.year, now.month, now.day);
+    // Today still counts as "in progress": an unfinished today does not break
+    // the streak, it just isn't added to it yet.
+    if (isDueOn(day) && !isDoneOn(day)) day = addDays(day, -1);
+    while (!day.isBefore(earliest)) {
       if (!isDueOn(day)) {
         day = addDays(day, -1);
         continue;
       }
-      if (isDoneOn(day)) {
-        streak++;
-        day = addDays(day, -1);
-      } else {
-        break;
-      }
+      if (!isDoneOn(day)) break;
+      streak++;
+      day = addDays(day, -1);
     }
     return streak;
   }
 
   int _flexibleStreak() {
     int streak = 0;
-    final today = DateTime.now();
+    final today = clock();
     final self = this;
     if (self.daysDoneInRange(mondayOf(today), today) >= timesPerWeek) {
       streak++;
@@ -2285,15 +2318,17 @@ class Habit {
   int longestStreak() {
     if (isFlexible) {
       int best = 0;
-      var weekStart = mondayOf(DateTime.now());
+      int run = 0;
+      final thisWeek = mondayOf(clock());
       for (var ws = mondayOf(_earliest());
-          !ws.isAfter(weekStart);
+          !ws.isAfter(thisWeek);
           ws = addDays(ws, 7)) {
-        if (daysDoneInRange(ws, addDays(ws, 6)) >=
-            timesPerWeek) {
-          best++;
-        } else if (best > 0) {
-          break;
+        if (daysDoneInRange(ws, addDays(ws, 6)) >= timesPerWeek) {
+          run++;
+          if (run > best) best = run;
+        } else if (ws != thisWeek) {
+          // The current week can still be completed, so it never ends a run.
+          run = 0;
         }
       }
       return best;
@@ -2301,7 +2336,7 @@ class Habit {
     int best = 0;
     int run = 0;
     for (var d = _earliest();
-        !d.isAfter(DateTime.now());
+        !d.isAfter(clock());
         d = addDays(d, 1)) {
       if (!isDueOn(d)) continue;
       if (isDoneOn(d)) {
@@ -2378,7 +2413,7 @@ class Habit {
     int weeks = 0;
     int run = 0;
     for (var d = _earliest();
-        !d.isAfter(DateTime.now());
+        !d.isAfter(clock());
         d = addDays(d, 1)) {
       if (!isDueOn(d)) continue;
       if (isDoneOn(d)) {
@@ -2398,7 +2433,7 @@ class Habit {
     int done = 0;
     int due = 0;
     for (int i = 0; i < n; i++) {
-      final d = addDays(DateTime.now(), -i);
+      final d = addDays(clock(), -i);
       if (!isDueOn(d)) continue;
       due++;
       if (isDoneOn(d)) done++;
@@ -2510,6 +2545,33 @@ class XpSystem {
     return (xp: xp, level: levelForXp(xp));
   }
 
+  static String _awardsKey() => 'xp_awards_${AuthService.email}';
+
+  /// Adds [amount] XP only the first time [reason] is seen today, so undoing
+  /// and redoing a check-in (or re-picking a mood) can't farm XP. Only
+  /// today's reasons are kept: past days can no longer be toggled.
+  static Future<({int xp, int level, bool leveledUp, bool awarded})> addOnce(
+      String reason, int amount) async {
+    final p = await SharedPreferences.getInstance();
+    final today = dayKey(clock());
+    final key = '$today|$reason';
+    final seen = (p.getStringList(_awardsKey()) ?? [])
+        .where((k) => k.startsWith('$today|'))
+        .toList();
+    if (seen.contains(key)) {
+      final xp = p.getInt(_key()) ?? 0;
+      return (xp: xp, level: levelForXp(xp), leveledUp: false, awarded: false);
+    }
+    await p.setStringList(_awardsKey(), [...seen, key]);
+    final res = await add(amount);
+    return (
+      xp: res.xp,
+      level: res.level,
+      leveledUp: res.leveledUp,
+      awarded: true,
+    );
+  }
+
   static Future<({int xp, int level, bool leveledUp})> add(int amount) async {
     final p = await SharedPreferences.getInstance();
     final oldXp = p.getInt(_key()) ?? 0;
@@ -2540,7 +2602,7 @@ String monthLabel(int month) =>
 Map<int, double> weekdayConsistency(List<Habit> habits, int weeks) {
   final done = {for (var w = 1; w <= 7; w++) w: 0};
   final total = {for (var w = 1; w <= 7; w++) w: 0};
-  final today = DateTime.now();
+  final today = clock();
   for (int i = 0; i < weeks * 7; i++) {
     final d = addDays(today, -i);
     total[d.weekday] = total[d.weekday]! + habits.where((h) => h.isDueOn(d)).length;
@@ -2590,7 +2652,7 @@ String bestWeekdayLabel(List<Habit> habits) {
 
 List<({int year, int month, String label, double rate})> monthSeries(
     List<Habit> habits, int months) {
-  final now = DateTime.now();
+  final now = clock();
   final out = <({int year, int month, String label, double rate})>[];
   for (int i = months - 1; i >= 0; i--) {
     final dt = DateTime(now.year, now.month - i, 1);
@@ -2626,7 +2688,7 @@ bool sameDay(DateTime a, DateTime b) => dayKey(a) == dayKey(b);
 
 List<String> buildInsights(List<Habit> habits) {
   final out = <String>[];
-  final today = DateTime.now();
+  final today = clock();
   if (habits.isEmpty) {
     out.add(t('أضف أول عادة لتبدأ بملاحظاتك الذكية.',
         'Add your first habit to start your smart insights.'));
@@ -2680,7 +2742,7 @@ List<String> buildInsights(List<Habit> habits) {
 }
 
 Habit? atRiskHabit(List<Habit> habits) {
-  final today = DateTime.now();
+  final today = clock();
   final due = habits.where((h) => h.isDueOn(today) && !h.isDoneOn(today)).toList();
   if (due.isEmpty) return null;
   due.sort((a, b) {
@@ -2700,20 +2762,22 @@ class MoodSystem {
   static Future<int?> todayMood() async {
     final p = await SharedPreferences.getInstance();
     return p.getInt(
-        _moodKey(AuthService.email, dayKey(DateTime.now())));
+        _moodKey(AuthService.email, dayKey(clock())));
   }
 
-  static Future<void> save(int mood) async {
+  /// Saves today's mood and returns whether it earned XP.
+  static Future<bool> save(int mood) async {
     final p = await SharedPreferences.getInstance();
-    await p.setInt(_moodKey(AuthService.email, dayKey(DateTime.now())), mood);
-    if (mood >= 4) await XpSystem.add(5);
+    await p.setInt(_moodKey(AuthService.email, dayKey(clock())), mood);
+    if (mood < 4) return false;
+    return (await XpSystem.addOnce('mood', 5)).awarded;
   }
 
   static Future<int> goodMoodStreak() async {
     final p = await SharedPreferences.getInstance();
     var streak = 0;
     for (var i = 0; i < 60; i++) {
-      final d = addDays(DateTime.now(), -i);
+      final d = addDays(clock(), -i);
       final m = p.getInt(_moodKey(AuthService.email, dayKey(d)));
       if (m == null || m < 4) break;
       streak++;
@@ -2725,7 +2789,7 @@ class MoodSystem {
     final p = await SharedPreferences.getInstance();
     final out = <String, int>{};
     for (var i = 0; i < 14; i++) {
-      final d = dayKey(addDays(DateTime.now(), -i));
+      final d = dayKey(addDays(clock(), -i));
       final m = p.getInt(_moodKey(AuthService.email, d));
       if (m != null) out[d] = m;
     }
@@ -2835,21 +2899,24 @@ class BadgeSystem {
       }
     }
     for (final key in allDates) {
-      final day = parseDayKey(key);
-      final done = habits.where((h) => h.isDoneOn(day)).length;
-      if (done == habits.length) return true;
+      if (_allDueDone(habits, parseDayKey(key))) return true;
     }
     return false;
+  }
+
+  /// Every habit due on [day] was completed (and at least one was due).
+  static bool _allDueDone(List<Habit> habits, DateTime day) {
+    final due = habits.where((h) => h.isDueOn(day)).toList();
+    return due.isNotEmpty && due.every((h) => h.isDoneOn(day));
   }
 
   static bool _perfectWeekEver(List<Habit> habits) {
     if (habits.length < 2) return false;
     for (var offset = 0; offset < 60; offset++) {
-      final start = addDays(DateTime.now(), -(7 + offset));
+      final start = addDays(clock(), -(7 + offset));
       var ok = true;
       for (var i = 0; i < 7; i++) {
-        final day = addDays(start, i);
-        if (habits.where((h) => h.isDoneOn(day)).length != habits.length) {
+        if (!_allDueDone(habits, addDays(start, i))) {
           ok = false;
           break;
         }
@@ -2860,12 +2927,12 @@ class BadgeSystem {
   }
 
   static bool _hundredWeek(List<Habit> habits) =>
-      habits.fold<int>(0, (s, h) => s + h.daysDoneInRange(addDays(DateTime.now(), -6), DateTime.now())) >= 100;
+      habits.fold<int>(0, (s, h) => s + h.daysDoneInRange(addDays(clock(), -6), clock())) >= 100;
 
   static bool _singlePerfectWeek(List<Habit> habits) {
     if (habits.isEmpty) return false;
     for (final h in habits) {
-      if (h.numberOfStreaks >= 6) return true;
+      if (h.numberOfStreaks >= 1) return true;
     }
     return false;
   }
@@ -3016,7 +3083,7 @@ class ChallengeSystem {
 
   static ({String id, String title, String desc, int target, int xp}) today(
       List<Habit> habits) {
-    final now = DateTime.now();
+    final now = clock();
     final dayIdx =
         (now.year * 372 + now.month * 31 + now.day) % _names.length;
     final measurable =
@@ -3070,7 +3137,7 @@ class ChallengeSystem {
   }
 
   static Future<int> progress(List<Habit> habits, String id) async {
-    final now = DateTime.now();
+    final now = clock();
     switch (id) {
       case 'kill_it':
         final done = habits.where((h) => h.isDueOn(now) && h.isDoneOn(now)).length;
@@ -3095,15 +3162,17 @@ class ChallengeSystem {
   }
 
   static Future<({bool done, int xp, bool leveled})> maybeComplete(
-      List<Habit> habits, String id, int target) async {
-    final date = dayKey(DateTime.now());
+      List<Habit> habits, String id, int target, int xp) async {
+    final date = dayKey(clock());
     if (await isClaimed(date)) return (done: true, xp: 0, leveled: false);
+    // A target of 0 (no habits due today) must not count as "completed".
+    if (target <= 0) return (done: false, xp: 0, leveled: false);
     final prog = await progress(habits, id);
     if (prog < target) return (done: false, xp: 0, leveled: false);
     final p = await SharedPreferences.getInstance();
     await p.setString(_key(date), 'done|$id');
-    final res = await XpSystem.add(40);
-    return (done: true, xp: 40, leveled: res.leveledUp);
+    final res = await XpSystem.add(xp);
+    return (done: true, xp: xp, leveled: res.leveledUp);
   }
 }
 
@@ -3120,12 +3189,12 @@ class RatingService {
     final p = await SharedPreferences.getInstance();
     if (p.getBool('rating_done') ?? false) return;
     final last = p.getInt('rating_last_prompt') ?? 0;
-    if (DateTime.now().millisecondsSinceEpoch - last <
+    if (clock().millisecondsSinceEpoch - last <
         30 * 24 * 3600 * 1000) {
       return;
     }
     _promptedInSession = true;
-    await p.setInt('rating_last_prompt', DateTime.now().millisecondsSinceEpoch);
+    await p.setInt('rating_last_prompt', clock().millisecondsSinceEpoch);
     if (!context.mounted) return;
     final result = await showDialog<String>(
       context: context,
@@ -3204,7 +3273,7 @@ class _HomePageState extends State<HomePage> {
     if (!AuthService.isProUser) return;
     final chal = ChallengeSystem.today(habits);
     final prog = await ChallengeSystem.progress(habits, chal.id);
-    final claimed = await ChallengeSystem.isClaimed(dayKey(DateTime.now()));
+    final claimed = await ChallengeSystem.isClaimed(dayKey(clock()));
     final mood = await MoodSystem.todayMood();
     final moodStreak = await MoodSystem.goodMoodStreak();
     if (mounted) {
@@ -3285,7 +3354,7 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _toggleToday(Habit habit) async {
-    final now = DateTime.now();
+    final now = clock();
     final today = dayKey(now);
     if (habit.isMeasurable) {
       await _recordAmount(habit);
@@ -3312,8 +3381,9 @@ class _HomePageState extends State<HomePage> {
   Future<void> _afterComplete(Habit habit, DateTime now) async {
     final comeback = habit.isComebackOn(now);
     await _award(habit);
+    final dueNow = habits.where((h) => h.isDueOn(now));
     final perfectDay =
-        habits.isNotEmpty && habits.every((h) => h.isDoneOn(now));
+        dueNow.isNotEmpty && dueNow.every((h) => h.isDoneOn(now));
     if (comeback) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -3381,7 +3451,7 @@ class _HomePageState extends State<HomePage> {
               'Logging progress on measurable habits is a Pro feature.'));
       return;
     }
-    final now = DateTime.now();
+    final now = clock();
     final today = dayKey(now);
     final recorded = habit.amountOn(now);
     final remaining = habit.target - recorded;
@@ -3478,7 +3548,7 @@ class _HomePageState extends State<HomePage> {
 
   void _cheer() {
     if (!mounted) return;
-    final idx = DateTime.now().millisecondsSinceEpoch % _cheersEn.length;
+    final idx = clock().millisecondsSinceEpoch % _cheersEn.length;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text(Language.isAr ? _cheersAr[idx] : _cheersEn[idx]),
@@ -3493,9 +3563,9 @@ class _HomePageState extends State<HomePage> {
     const streakBonus = {7: 50, 30: 150, 100: 500, 365: 2000};
     final streak = habit.currentStreak();
     final bonus = streakBonus[streak] ?? 0;
-    final res = await XpSystem.add(10 + bonus);
+    final res = await XpSystem.addOnce('habit|${habit.id}', 10 + bonus);
     await _refreshXp();
-    if (!mounted) return;
+    if (!mounted || !res.awarded) return;
     if (res.leveledUp) {
       _showLevelUp(res.level);
     } else {
@@ -3513,12 +3583,13 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _setMood(int mood) async {
-    await MoodSystem.save(mood);
+    final earned = await MoodSystem.save(mood);
     await _loadExtras();
+    await _refreshXp();
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-        content: Text(mood >= 4
+        content: Text(earned
             ? t('أجواء رائعة اليوم ${ltr('+5 XP')} ✨', 'Great mood today +5 XP ✨')
             : t('شكراً لتفاعلك معنا 💛', 'Thanks for sharing 💛')),
         behavior: SnackBarBehavior.floating,
@@ -3548,7 +3619,7 @@ class _HomePageState extends State<HomePage> {
     await _loadExtras();
     final challenge = ChallengeSystem.today(habits);
     final res = await ChallengeSystem.maybeComplete(
-        habits, challenge.id, challenge.target);
+        habits, challenge.id, challenge.target, challenge.xp);
     if (res.done) await _loadExtras();
     if (!mounted) return;
     if (newly.isNotEmpty) _showBadgeUnlocked(newly);
@@ -3674,9 +3745,9 @@ child: Text(t('رائع!', 'Awesome!')),
   }
 
   double get todayProgress {
-    final due = habits.where((h) => h.isDueOn(DateTime.now())).toList();
+    final due = habits.where((h) => h.isDueOn(clock())).toList();
     if (due.isEmpty) return 0;
-    final done = due.where((h) => h.isDoneOn(DateTime.now())).length;
+    final done = due.where((h) => h.isDoneOn(clock())).length;
     return done / due.length;
   }
 
@@ -3685,27 +3756,32 @@ child: Text(t('رائع!', 'Awesome!')),
     final primary = Theme.of(context).colorScheme.primary;
     final tertiary = Theme.of(context).colorScheme.tertiary;
     final brightness = Theme.of(context).brightness;
-    final now = DateTime.now();
+    final now = clock();
     final quote = quoteFor(now);
 
-    final done = habits.where((h) => h.isDoneOn(DateTime.now())).length;
+    final dueToday = habits.where((h) => h.isDueOn(now)).toList();
+    final done = dueToday.where((h) => h.isDoneOn(now)).length;
+    final dueCount = dueToday.length;
     String headline;
     String sub;
     if (habits.isEmpty) {
       headline = t('جاهز تبني يومك؟ 💪', 'Ready to build your day? 💪');
       sub = t('أضف أول عادة وابدأ صغيراً.', 'Add your first habit and start small.');
+    } else if (dueCount == 0) {
+      headline = t('يوم راحة 🌿', 'Rest day 🌿');
+      sub = t('لا توجد عادات مطلوبة اليوم.', 'No habits are due today.');
     } else if (done == 0) {
       headline = t("لنُنجز اليوم 💪", "Let's get it done today 💪");
-      sub = t('انتهيت من $done من ${habits.length} عادات حتى الآن.',
-          'Finished $done of ${habits.length} habits so far.');
-    } else if (done < habits.length) {
+      sub = t('انتهيت من $done من $dueCount عادات حتى الآن.',
+          'Finished $done of $dueCount habits so far.');
+    } else if (done < dueCount) {
       headline = t("أنت على نار 🔥", "You're on fire 🔥");
-      sub = t('انتهيت من $done من ${habits.length} عادات. استمر!',
-          'Finished $done of ${habits.length} habits. Keep going!');
+      sub = t('انتهيت من $done من $dueCount عادات. استمر!',
+          'Finished $done of $dueCount habits. Keep going!');
     } else {
       headline = t('يوم مثالي! 🎉', 'Perfect day! 🎉');
-      sub = t('أنهيت كل الـ ${habits.length} عادات. لا أحد يوقفك!',
-          'You completed all ${habits.length} habits. Nothing stops you!');
+      sub = t('أنهيت كل الـ $dueCount عادات. لا أحد يوقفك!',
+          'You completed all $dueCount habits. Nothing stops you!');
     }
     final greeting = now.hour < 12
         ? t('صباح الخير', 'Good morning')
@@ -4169,13 +4245,13 @@ Text(t('محلي · خاص', 'Local · private'),
               ...habits.asMap().entries.map((entry) {
                 final i = entry.key;
                 final habit = entry.value;
-                final done = habit.isDoneOn(DateTime.now());
+                final done = habit.isDoneOn(clock());
                 final streak = habit.currentStreak();
-                final amount = habit.amountOn(DateTime.now());
+                final amount = habit.amountOn(clock());
                 final onDone = Theme.of(context).colorScheme.onPrimary;
                 final onDoneSoft = onDone.withAlpha(200);
                 return Dismissible(
-                  key: Key(habit.name + i.toString()),
+                  key: ValueKey(habit.id),
                   direction: DismissDirection.endToStart,
                   background: Container(
                     alignment: AlignmentDirectional.centerEnd,
@@ -5287,6 +5363,7 @@ Future<void> showHabitDialog(
   );
   final icons = Habit.basicIcons;
   const weekDays = [1, 2, 3, 4, 5, 6, 7];
+  String? formError;
 
   return showDialog(
     context: context,
@@ -5721,6 +5798,13 @@ Future<void> showHabitDialog(
                   }
                 },
               ),
+              if (formError != null) ...[
+                const SizedBox(height: 8),
+                Text(formError!,
+                    style: TextStyle(
+                        color: Theme.of(context).colorScheme.error,
+                        fontWeight: FontWeight.w600)),
+              ],
             ],
           ),
         ),
@@ -5733,7 +5817,26 @@ Future<void> showHabitDialog(
           FilledButton(
             onPressed: () {
               final name = controller.text.trim();
-              if (name.isEmpty) return;
+              String? error;
+              if (name.isEmpty) {
+                error = t('اكتب اسم العادة', 'Enter a habit name');
+              } else if (frequency == 1 && weekdays.isEmpty) {
+                error = t('اختر يوماً واحداً على الأقل',
+                    'Pick at least one day');
+              } else if (measurable &&
+                  targetController.text.trim().isNotEmpty &&
+                  (double.tryParse(targetController.text
+                              .trim()
+                              .replaceAll(',', '.')) ??
+                          0) <=
+                      0) {
+                error = t('الهدف لازم يكون رقم أكبر من صفر',
+                    'Goal must be a number greater than zero');
+              }
+              if (error != null) {
+                setDialogState(() => formError = error);
+                return;
+              }
               final target = double.tryParse(
                       targetController.text.trim().replaceAll(',', '.')) ??
                   0;
@@ -5743,6 +5846,7 @@ Future<void> showHabitDialog(
                 id: existing?.id,
                 completedDates: existing?.completedDates,
                 amounts: existing?.amounts,
+                doneAt: existing?.doneAt,
                 frequency: frequency,
                 weekdays:
                     frequency == 1 ? List.of(weekdays) : [1, 2, 3, 4, 5, 6, 7],
@@ -5953,7 +6057,7 @@ class _HabitDetailPageState extends State<HabitDetailPage> {
 
   Future<void> _recordNow() async {
     final habit = widget.habit;
-    final now = DateTime.now();
+    final now = clock();
     final wasDone = habit.isDoneOn(now);
     final controller = TextEditingController();
     final recorded = habit.amountOn(now);
@@ -6016,11 +6120,15 @@ class _HabitDetailPageState extends State<HabitDetailPage> {
     setState(() {
       habit.amounts[dayKey(now)] =
           (habit.amounts[dayKey(now)] ?? 0) + result;
+      if (!wasDone && habit.isDoneOn(now)) habit.setDoneAt(now);
     });
     _compute();
     widget.onUpdate(habit);
     if (!wasDone && habit.isDoneOn(now)) {
-      final res = await XpSystem.add(10);
+      // Same reason key as the home screen, so a goal is rewarded once a day
+      // no matter which screen it was logged from.
+      final res = await XpSystem.addOnce('habit|${habit.id}', 10);
+      if (!res.awarded) return;
       if (res.leveledUp) {
         _showLevelUp(res.level);
       } else if (mounted) {
@@ -6115,7 +6223,7 @@ class _HabitDetailPageState extends State<HabitDetailPage> {
     final primary = Theme.of(context).colorScheme.primary;
     final brightness = Theme.of(context).brightness;
     final habit = widget.habit;
-    final today = DateTime.now();
+    final today = clock();
 
     // heatmap: 12 weeks aligned to Sunday
     final start = addDays(today, -(77 + (today.weekday % 7)));
@@ -6416,13 +6524,15 @@ class _StatsPageState extends State<StatsPage> {
     }
   }
 
+  /// Completion % of the habits due on each of the last 7 days, oldest first
+  /// (index 6 is today).
   List<double> _last7DaysPercent() {
-    final today = DateTime.now();
+    final today = clock();
     return List.generate(7, (i) {
       final day = addDays(today, -(6 - i));
-      if (habits.isEmpty) return 0.0;
-      final done = habits.where((h) => h.isDoneOn(day)).length;
-      return done / habits.length * 100;
+      final due = habits.where((h) => h.isDueOn(day)).toList();
+      if (due.isEmpty) return 0.0;
+      return due.where((h) => h.isDoneOn(day)).length / due.length * 100;
     });
   }
 
@@ -6435,7 +6545,7 @@ class _StatsPageState extends State<StatsPage> {
     // and today is always the last bar.
     const todayIndex = 6;
     String barLabel(int i) =>
-        weekdayShortLabel(addDays(DateTime.now(), -(6 - i)).weekday);
+        weekdayShortLabel(addDays(clock(), -(6 - i)).weekday);
     final totalCompletions = habits.fold<int>(
         0, (sum, h) => sum + h.countCompletions());
 
@@ -6454,7 +6564,7 @@ class _StatsPageState extends State<StatsPage> {
     var done30 = 0, due30 = 0;
     for (final h in habits) {
       for (int i = 0; i < 30; i++) {
-        final d = addDays(DateTime.now(), -i);
+        final d = addDays(clock(), -i);
         if (h.isDueOn(d)) {
           due30++;
           if (h.isDoneOn(d)) done30++;
@@ -6796,8 +6906,8 @@ class _StatsPageState extends State<StatsPage> {
                             style: TextStyle(
                               fontSize: 9,
                               color: monthData[i].month ==
-                                      DateTime.now().month &&
-                                  monthData[i].year == DateTime.now().year
+                                      clock().month &&
+                                  monthData[i].year == clock().year
                                   ? primary
                                   : Colors.grey,
                             ),
@@ -7388,7 +7498,7 @@ class YearHeatmap extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final today = DateTime.now();
+    final today = clock();
     final todayMid = DateTime(today.year, today.month, today.day);
     final gridStart =
         Habit.mondayOf(addDays(todayMid, -364));
