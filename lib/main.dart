@@ -377,13 +377,23 @@ class BillingService {
   bool get hasYearlyTrial => _yearlyTrial != null;
   String? get lastError => _lastError;
 
+  // Play can leave these calls pending forever (seen on an emulator whose
+  // billing service never answered), which kept the paywall on "Loading…"
+  // and the buy button spinning. Time out and treat it as unavailable.
+  static const _storeTimeout = Duration(seconds: 10);
+
   Future<bool> available() async {
-    try { return await _iap.isAvailable(); } catch (_) { return false; }
+    try {
+      return await _iap.isAvailable().timeout(_storeTimeout);
+    } catch (_) {
+      return false;
+    }
   }
 
   Future<void> ensureProducts() async {
     try {
-      final res = await _iap.queryProductDetails(productIds);
+      final res =
+          await _iap.queryProductDetails(productIds).timeout(_storeTimeout);
       _plans.clear();
       _yearlyTrial = null;
       // A subscription comes back once per base plan and once per offer. The
@@ -5307,8 +5317,13 @@ class _ProPageState extends State<ProPage> {
                                     strokeWidth: 2.5, color: Colors.white))
                             : Text(
                                 _pro == null
-                                    ? t('التفاصيل عند فتح Play…',
-                                        'Loading store details…')
+                                    ? (_loading
+                                        ? t('التفاصيل عند فتح Play…',
+                                            'Loading store details…')
+                                        // Loading finished without this
+                                        // product: don't claim to be loading.
+                                        : t('المتجر غير متاح الآن',
+                                            'Store unavailable right now'))
                                     : switch (_selected) {
                                         ProPlan.yearly when BillingService
                                                 .instance.hasYearlyTrial =>
@@ -5381,8 +5396,9 @@ class _PlanTile extends StatelessWidget {
       ProPlan.lifetime => t('مدى الحياة', 'Lifetime'),
     };
     final period = switch (plan) {
-      ProPlan.monthly => t('/شهر', '/month'),
-      ProPlan.yearly => t('/سنة', '/year'),
+      // Words, not "/شهر": a leading slash lands on the wrong side in RTL.
+      ProPlan.monthly => t('شهرياً', '/month'),
+      ProPlan.yearly => t('سنوياً', '/year'),
       ProPlan.lifetime => t('مرة واحدة', 'one time'),
     };
     final saving = billing.yearlySavingPercent;
