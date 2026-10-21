@@ -65,6 +65,13 @@ String daysAr(int n) {
   return '$n يوم';
 }
 
+/// Arabic habit count: 1 عادة, 2 عادتين, 3–10 عادات, 11+ عادة.
+String habitsAr(int n) {
+  if (n == 2) return 'عادتين';
+  if (n >= 3 && n <= 10) return '$n عادات';
+  return '$n عادة';
+}
+
 /// "N day(s)" in the current language.
 String daysLabel(int n) => t(daysAr(n), n == 1 ? '$n day' : '$n days');
 
@@ -7755,7 +7762,7 @@ class _SettingsPageState extends State<SettingsPage> {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
                 content: Text(
-                    t('تمت استعادة ${habits.length} عادة بنجاح ✅',
+                    t('تمت استعادة ${habitsAr(habits.length)} بنجاح ✅',
                         'Restored ${habits.length} habits successfully ✅'))),
           );
           await _load();
@@ -7820,7 +7827,7 @@ class _SettingsPageState extends State<SettingsPage> {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
                 content: Text(t(
-                    'تمت استعادة ${habits.length} عادة وكل بياناتك ✅ ($xpV XP)',
+                    'تمت استعادة ${habitsAr(habits.length)} وكل بياناتك ✅ (${ltr('$xpV XP')})',
                     'Restored ${habits.length} habits and all your data ✅ ($xpV XP)'))),
           );
           await _load();
