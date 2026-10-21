@@ -39,24 +39,18 @@ class Language {
 String t(String ar, String en) => Language.isAr ? ar : en;
 
 class AuthService {
-  static const ownerEmail = 'zeyad@habitflow.app';
-  static const Map<String, String> testAccounts = {
-    'test1@habitflow.app': 'test123',
-    'test2@habitflow.app': 'test123',
-  };
   static const _salt = 'habitflow_salt_v1';
 
   static String? name;
   static String? email;
   static bool isPro = false;
 
-  static bool get isOwner => email == ownerEmail;
 
   static const minPasswordLength = 6;
 
   static bool isValidEmail(String email) =>
       RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(email.trim());
-  static bool get isProUser => isPro || isOwner;
+  static bool get isProUser => isPro;
 
   static String _hash(String password) =>
       sha256.convert(utf8.encode('$_salt:$password')).toString();
@@ -81,15 +75,6 @@ class AuthService {
     final clean = email.toLowerCase().trim();
     final savedEmail = prefs.getString('auth_email');
     final savedHash = prefs.getString('auth_hash');
-    if (savedEmail == null && savedHash == null &&
-        testAccounts[clean] == password) {
-      await prefs.setString('auth_name',
-          clean.startsWith('test2') ? 'صديق ٢' : 'صديق ١');
-      await prefs.setString('auth_email', clean);
-      await prefs.setString('auth_hash', _hash(password));
-      await prefs.setBool('isPro', true);
-      return true;
-    }
     if (savedEmail == null || savedHash == null) return false;
     if (savedEmail != clean) return false;
     if (savedHash != _hash(password)) return false;
@@ -3890,10 +3875,7 @@ class ProPage extends StatelessWidget {
                           size: 40),
                       const SizedBox(height: 8),
                       Text(
-                        AuthService.isOwner
-                            ? t('حساب المالك — برو مفعّل مجاناً 👑',
-                                'Owner account — Pro enabled for free 👑')
-                            : t('أنت عضو برو ✅', 'You are a Pro member ✅'),
+                        t('أنت عضو برو ✅', 'You are a Pro member ✅'),
                         style: const TextStyle(
                             fontSize: 15, fontWeight: FontWeight.bold),
                       ),
@@ -5904,8 +5886,8 @@ class _SettingsPageState extends State<SettingsPage> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  t('الحساب: ${AuthService.email ?? '-'}${AuthService.isOwner ? ' 👑 المالك' : ''}',
-                      'Account: ${AuthService.email ?? '-'}${AuthService.isOwner ? ' 👑 Owner' : ''}'),
+                  t('الحساب: ${AuthService.email ?? '-'}',
+                      'Account: ${AuthService.email ?? '-'}'),
                   style: const TextStyle(fontSize: 14),
                 ),
                 const SizedBox(height: 4),

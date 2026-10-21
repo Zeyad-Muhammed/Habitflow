@@ -246,4 +246,24 @@ void main() {
       expect(badge('perfectday').earned([daily, fridayOnly], 1, 0), isTrue);
     });
   });
+
+  group('auth', () {
+    setUp(() => SharedPreferences.setMockInitialValues({}));
+
+    test('former built-in test accounts no longer sign in or grant Pro',
+        () async {
+      expect(await AuthService.login('test1@habitflow.app', 'test123'), isFalse);
+      expect(await AuthService.hasAccount(), isFalse);
+    });
+
+    test('registering with the former owner email does not grant Pro',
+        () async {
+      expect(
+          await AuthService.register('Z', 'zeyad@habitflow.app', 'secret1'),
+          isTrue);
+      expect(await AuthService.login('zeyad@habitflow.app', 'secret1'), isTrue);
+      await AuthService.startSession();
+      expect(AuthService.isProUser, isFalse);
+    });
+  });
 }
