@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Shown by Pro widgets on the free plan. Fills any cell size (4x1 up to 4x2)
+     and keeps its content centred. -->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/w_root" android:layout_width="match_parent" android:layout_height="match_parent"
+    android:background="@drawable/w_bg_dark">
+    <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:layout_gravity="center_vertical" android:orientation="horizontal" android:gravity="center_vertical"
+        android:paddingStart="14dp" android:paddingEnd="12dp">
+        <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="🔒"
+            android:textSize="20sp"/>
+        <LinearLayout android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1"
+            android:layout_marginStart="10dp" android:layout_marginEnd="8dp" android:orientation="vertical">
+            <TextView android:id="@+id/w_title" android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:text="HabitFlow Pro" android:textSize="14sp" android:textStyle="bold" android:textColor="#ECEDF0"
+                android:textAlignment="viewStart" android:maxLines="1" android:ellipsize="end"/>
+            <TextView android:id="@+id/w_sub" android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:text="Upgrade to Pro to unlock this widget" android:textSize="11sp" android:textColor="#9AA0A6"
+                android:textAlignment="viewStart" android:maxLines="2" android:ellipsize="end"/>
+        </LinearLayout>
+        <TextView android:id="@+id/w_cta" android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:background="@drawable/w_chip_on_dark" android:paddingStart="12dp" android:paddingEnd="12dp"
+            android:paddingTop="6dp" android:paddingBottom="6dp" android:text="Upgrade" android:textSize="12sp"
+            android:textStyle="bold" android:textColor="#2B1F4A" android:maxLines="1"/>
+    </LinearLayout>
+</FrameLayout>

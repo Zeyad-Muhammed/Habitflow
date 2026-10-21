@@ -80,8 +80,11 @@
                 <action android:name="android.intent.action.QUICKBOOT_POWERON"/>
             </intent-filter>
         </receiver>
+        <!-- Home-screen widgets. The first two keep their old class names so
+             widgets already placed by users survive the update. -->
         <receiver
             android:name=".HabitWidgetProvider"
+            android:label="@string/wname_today"
             android:exported="false">
             <intent-filter>
                 <action android:name="android.appwidget.action.APPWIDGET_UPDATE"/>
@@ -92,6 +95,7 @@
         </receiver>
         <receiver
             android:name=".HabitSingleWidgetProvider"
+            android:label="@string/wname_single"
             android:exported="false">
             <intent-filter>
                 <action android:name="android.appwidget.action.APPWIDGET_UPDATE"/>
@@ -101,13 +105,65 @@
                 android:resource="@xml/widget_single_info"/>
         </receiver>
         <receiver
+            android:name=".ProgressRingWidget"
+            android:label="@string/wname_ring"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE"/>
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_ring_info"/>
+        </receiver>
+        <receiver
+            android:name=".HeatmapWidget"
+            android:label="@string/wname_heatmap"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE"/>
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_heatmap_info"/>
+        </receiver>
+        <receiver
+            android:name=".LevelWidget"
+            android:label="@string/wname_level"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE"/>
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_level_info"/>
+        </receiver>
+        <receiver
+            android:name=".MoodQuoteWidget"
+            android:label="@string/wname_mood"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE"/>
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_mood_info"/>
+        </receiver>
+        <!-- Widget ✔ taps, the midnight refresh and clock changes. -->
+        <receiver
             android:name=".WidgetToggleReceiver"
-            android:exported="false" />
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.TIME_SET"/>
+                <action android:name="android.intent.action.TIMEZONE_CHANGED"/>
+                <action android:name="android.intent.action.BOOT_COMPLETED"/>
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED"/>
+            </intent-filter>
+        </receiver>
         <activity
             android:name=".HabitConfigActivity"
             android:exported="true"
             android:excludeFromRecents="true"
-            android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            android:theme="@android:style/Theme.Material.NoActionBar">
             <intent-filter>
                 <action android:name="android.appwidget.action.APPWIDGET_CONFIGURE"/>
             </intent-filter>
