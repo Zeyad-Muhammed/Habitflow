@@ -1,4 +1,4 @@
-package com.zeyad.habit_tracker
+package com.novu.HabitFlow
 
 import android.appwidget.AppWidgetManager
 import android.content.ComponentName
@@ -25,7 +25,7 @@ class MainActivity : FlutterActivity() {
         super.configureFlutterEngine(flutterEngine)
         MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
-            "com.zeyad.habit_tracker/widget"
+            "com.novu.HabitFlow/widget"
         ).setMethodCallHandler { call, _ ->
             if (call.method == "refresh") refreshWidget()
         }
@@ -39,6 +39,7 @@ class MainActivity : FlutterActivity() {
                 ComponentName(context, HabitWidgetProvider::class.java)
             )
             val intent = Intent(AppWidgetManager.ACTION_APPWIDGET_UPDATE)
+            intent.setComponent(ComponentName(context, HabitWidgetProvider::class.java))
             intent.putExtra(AppWidgetManager.EXTRA_APPWIDGET_IDS, ids)
             context.sendBroadcast(intent)
         } catch (_: Exception) {

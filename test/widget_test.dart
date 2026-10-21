@@ -3,38 +3,68 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:habit_tracker/main.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+/// The app resolves its language from the static [Language.code], which is only
+/// populated by Language.load() inside main(). Widget tests never run main(),
+/// so the language has to be forced here or every assertion sees Arabic.
+///
+/// Language.set() writes through SharedPreferences, so the mock store must be
+/// installed *before* calling it, otherwise the write is discarded.
+Future<void> launchApp(
+  WidgetTester tester, {
+  Map<String, Object> prefs = const {},
+  String lang = 'en',
+}) async {
+  SharedPreferences.setMockInitialValues({...prefs, 'app_lang': lang});
+  await Language.set(lang);
+  await tester.pumpWidget(const HabitFlowApp());
+  await tester.pump(const Duration(seconds: 2));
+  await tester.pump(const Duration(seconds: 2));
+}
+
 void main() {
-  testWidgets('first launch shows Arabic onboarding', (tester) async {
-    SharedPreferences.setMockInitialValues({});
-    await Language.load();
-    await tester.pumpWidget(const HabitFlowApp());
-    await tester.pump(const Duration(seconds: 1));
-    expect(find.text('ابنِ أياماً أفضل'), findsOneWidget);
-    expect(find.text('تخطّي'), findsOneWidget);
+  testWidgets('first launch shows onboarding', (WidgetTester tester) async {
+    await launchApp(tester);
+    expect(find.byType(OnboardingPage), findsOneWidget);
   });
 
-  testWidgets('after onboarding, a new user sees sign-up (English)',
-      (tester) async {
-    SharedPreferences.setMockInitialValues({
-      'app_lang': 'en',
-      'onboarding_done': true,
-    });
-    await Language.load();
-    await tester.pumpWidget(const HabitFlowApp());
+  testWidgets('completing onboarding reaches the auth page',
+      (WidgetTester tester) async {
+    await launchApp(tester);
+    expect(find.byType(OnboardingPage), findsOneWidget);
+
+    // Drive the onboarding PageView to the last slide, then finish it.
+    final skip = find.text('Skip');
+    if (skip.evaluate().isNotEmpty) {
+      await tester.tap(skip.last);
+    } else {
+      await tester.drag(find.byType(PageView), const Offset(-500, 0));
+    }
+    await tester.pump();
     await tester.pump(const Duration(seconds: 1));
-    expect(find.text('Create your account'), findsOneWidget);
-    expect(find.byType(TextField), findsNWidgets(3));
+
+    expect(find.byType(AuthPage), findsOneWidget);
   });
 
-  testWidgets('Arabic layout is right-to-left', (tester) async {
-    SharedPreferences.setMockInitialValues({
-      'app_lang': 'ar',
+  testWidgets('auth page renders the signup form', (WidgetTester tester) async {
+    await launchApp(tester, prefs: {'onboarding_done': true});
+    expect(find.byType(AuthPage), findsOneWidget);
+    expect(find.text('Email'), findsOneWidget);
+  });
+
+  testWidgets('restored session goes straight to the main shell',
+      (WidgetTester tester) async {
+    await launchApp(tester, prefs: {
       'onboarding_done': true,
+      'auth_logged_in': true,
+      'auth_email': 'someone@example.com',
+      'auth_name': 'Tester',
     });
-    await Language.load();
-    await tester.pumpWidget(const HabitFlowApp());
-    await tester.pump(const Duration(seconds: 1));
-    final ctx = tester.element(find.text('أنشئ حسابك').first);
+    expect(find.byType(MainShell), findsOneWidget);
+  });
+
+  testWidgets('Arabic layout is right-to-left', (WidgetTester tester) async {
+    await launchApp(tester, prefs: {'onboarding_done': true}, lang: 'ar');
+    final ctx = tester.element(find.byType(Scaffold).first);
     expect(Directionality.of(ctx), TextDirection.rtl);
   });
 }

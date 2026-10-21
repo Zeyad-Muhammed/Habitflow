@@ -1,24 +1,35 @@
-﻿import 'dart:convert';
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
 import 'dart:math';
 import 'dart:ui' show DartPluginRegistrant;
 
 import 'package:crypto/crypto.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:share_plus/share_plus.dart';
 import 'package:fl_chart/fl_chart.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:flutter_timezone/flutter_timezone.dart';
 import 'package:google_mobile_ads/google_mobile_ads.dart';
+import 'package:in_app_purchase/in_app_purchase.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:timezone/data/latest_all.dart' as tzdata;
 import 'package:timezone/timezone.dart' as tz;
 import 'package:url_launcher/url_launcher.dart';
+import 'package:flutter_appauth/flutter_appauth.dart';
+import 'package:flutter_facebook_auth/flutter_facebook_auth.dart';
+import 'package:google_sign_in/google_sign_in.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Language.load();
   runApp(const HabitFlowApp());
+  refreshWidget();
 }
 
 class Language {
@@ -38,19 +49,53 @@ class Language {
 
 String t(String ar, String en) => Language.isAr ? ar : en;
 
+/// Left-to-right isolate: keeps numbers/Latin runs like "45 / 150 XP" in
+/// their natural order inside Arabic (RTL) sentences.
+String ltr(String s) => '\u2066$s\u2069';
+
+/// First-strong isolate for user text (habit names) embedded in a sentence,
+/// so a Latin name inside quotes does not scramble the surrounding Arabic.
+String iso(String s) => '\u2068$s\u2069';
+
+/// Arabic day count with the right plural form: 1 يوم, 2 يومين,
+/// 3–10 أيام, 11+ يوم.
+String daysAr(int n) {
+  if (n == 2) return 'يومين';
+  if (n >= 3 && n <= 10) return '$n أيام';
+  return '$n يوم';
+}
+
+/// Arabic habit count: 1 عادة, 2 عادتين, 3–10 عادات, 11+ عادة.
+String habitsAr(int n) {
+  if (n == 2) return 'عادتين';
+  if (n >= 3 && n <= 10) return '$n عادات';
+  return '$n عادة';
+}
+
+/// "N day(s)" in the current language.
+String daysLabel(int n) => t(daysAr(n), n == 1 ? '$n day' : '$n days');
+
+/// Calendar-safe day arithmetic. Adding Duration(days: n) breaks across DST
+/// changes (e.g. Africa/Cairo in late October) and can repeat or skip a date.
+DateTime addDays(DateTime d, int n) => DateTime(d.year, d.month, d.day + n);
+
 class AuthService {
   static const _salt = 'habitflow_salt_v1';
 
   static String? name;
   static String? email;
   static bool isPro = false;
+  static bool proFromBilling = false;
 
+  // TEST-ONLY: pass --dart-define=FORCE_PRO=true to build a Pro build.
+  // Production builds omit the define, so this stays false.
+  static const bool forceProTest = bool.fromEnvironment('FORCE_PRO');
 
   static const minPasswordLength = 6;
 
   static bool isValidEmail(String email) =>
       RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(email.trim());
-  static bool get isProUser => isPro;
+  static bool get isProUser => isPro || forceProTest;
 
   static String _hash(String password) =>
       sha256.convert(utf8.encode('$_salt:$password')).toString();
@@ -81,11 +126,27 @@ class AuthService {
     return true;
   }
 
+  static Future<bool> socialLogin(
+      {required String provider,
+      required String name,
+      required String email}) async {
+    final prefs = await SharedPreferences.getInstance();
+    final clean = email.toLowerCase().trim();
+    await prefs.setString('auth_name',
+        name.trim().isEmpty ? clean.split('@').first : name.trim());
+    await prefs.setString('auth_email', clean);
+    await prefs.setString('auth_hash', _hash('social:$provider:$clean'));
+    await prefs.setString('auth_provider', provider);
+    await prefs.setBool('isPro', false);
+    return true;
+  }
+
   static Future<void> startSession() async {
     final prefs = await SharedPreferences.getInstance();
     name = prefs.getString('auth_name');
     email = prefs.getString('auth_email');
     isPro = prefs.getBool('isPro') ?? false;
+    proFromBilling = prefs.getBool('proFromBilling') ?? false;
     await prefs.setBool('auth_logged_in', true);
   }
 
@@ -95,6 +156,7 @@ class AuthService {
     name = prefs.getString('auth_name');
     email = prefs.getString('auth_email');
     isPro = prefs.getBool('isPro') ?? false;
+    proFromBilling = prefs.getBool('proFromBilling') ?? false;
     return email != null;
   }
 
@@ -107,6 +169,13 @@ class AuthService {
     isPro = pro;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool('isPro', pro);
+    if (!pro) { await prefs.setBool('proFromBilling', false); proFromBilling = false; }
+  }
+
+  static Future<void> setProSourceBilling(bool fromBilling) async {
+    proFromBilling = fromBilling;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('proFromBilling', fromBilling);
   }
 
   // ---- Password reset (offline, per-device) ----
@@ -138,14 +207,263 @@ class AuthService {
   }
 }
 
+enum BillingOutcome { granted, pending, canceled, error, unavailable, noProduct, launchFailed }
+
+/// OAuth provider IDs. Replace the placeholders with your own values — see the
+/// step-by-step guide for creating them (Google Cloud, Facebook, Microsoft Entra).
+class SocialConfig {
+  static const String facebookAppId = 'REPLACE_FACEBOOK_APP_ID';
+  static const String facebookClientToken = 'REPLACE_FACEBOOK_CLIENT_TOKEN';
+  static const String microsoftTenantId = 'common';
+  static const String microsoftClientId = 'REPLACE_MICROSOFT_CLIENT_ID';
+  static const String microsoftRedirectUri =
+      'com.novu.HabitFlow://oauth2';
+
+  /// OAuth client ID from Google Cloud (Web application type). Empty until
+  /// google_sign_in has an authorised client for this package + signing cert.
+  static const String googleClientId = '';
+
+  /// Social providers only work once their platform credentials are filled in.
+  /// Until then the buttons are hidden so the release never shows a dead
+  /// "sign in" option that can only fail.
+  static bool isConfigured(String provider) {
+    switch (provider) {
+      case 'google':
+        return googleClientId.isNotEmpty;
+      case 'facebook':
+        return facebookAppId != 'REPLACE_FACEBOOK_APP_ID' &&
+            facebookClientToken != 'REPLACE_FACEBOOK_CLIENT_TOKEN';
+      case 'microsoft':
+        return microsoftClientId != 'REPLACE_MICROSOFT_CLIENT_ID';
+      default:
+        return true;
+    }
+  }
+
+  /// Keeps the "Or continue with" divider from rendering as an orphan when
+  /// every provider is hidden.
+  static bool get anyConfigured =>
+      isConfigured('google') ||
+      isConfigured('facebook') ||
+      isConfigured('microsoft');
+}
+
+class SocialAuth {
+  static final _google = GoogleSignIn();
+
+  static Future<({String name, String email, String provider})?>
+      signIn(String provider) async {
+    switch (provider) {
+      case 'google':
+        return _signInGoogle();
+      case 'facebook':
+        return _signInFacebook();
+      case 'microsoft':
+        return _signInMicrosoft();
+    }
+    return null;
+  }
+
+  static Future<({String name, String email, String provider})?>
+      _signInGoogle() async {
+    final acc = await _google.signIn();
+    if (acc == null) return null;
+    return (
+      name: acc.displayName ?? acc.email.split('@').first,
+      email: acc.email,
+      provider: 'google'
+    );
+  }
+
+  static Future<({String name, String email, String provider})?>
+      _signInFacebook() async {
+    final res =
+        await FacebookAuth.instance.login(permissions: ['email', 'public_profile']);
+    if (res.status != LoginStatus.success) return null;
+    final data = await FacebookAuth.instance.getUserData(
+        fields: 'email,name');
+    final email = data['email'] as String?;
+    if (email == null) {
+      throw Exception('Facebook did not return an email address');
+    }
+    return (
+      name: (data['name'] as String?) ?? email.split('@').first,
+      email: email,
+      provider: 'facebook'
+    );
+  }
+
+  static final _appauth = FlutterAppAuth();
+  static const _microsoftDiscovery =
+      'https://login.microsoftonline.com/common/v2.0/.well-known/openid-configuration';
+
+  static Future<({String name, String email, String provider})?>
+      _signInMicrosoft() async {
+    final clientId = SocialConfig.microsoftClientId;
+    if (clientId.startsWith('REPLACE_')) {
+      throw Exception('Microsoft client id is not configured yet');
+    }
+    final auth = await _appauth.authorizeAndExchangeCode(
+      AuthorizationTokenRequest(
+        clientId,
+        SocialConfig.microsoftRedirectUri,
+        discoveryUrl: _microsoftDiscovery,
+        scopes: ['openid', 'profile', 'email'],
+        promptValues: ['select_account'],
+      ),
+    );
+    final idToken = auth.idToken;
+    if (idToken == null) {
+      throw Exception('Microsoft did not return an id token');
+    }
+    final claims = _decodeIdToken(idToken);
+    final email = (claims['email'] as String?) ??
+        (claims['preferred_username'] as String?);
+    if (email == null) throw Exception('Microsoft did not return an email');
+    return (
+      name: (claims['name'] as String?) ?? email.split('@').first,
+      email: email,
+      provider: 'microsoft'
+    );
+  }
+
+  static Map<String, dynamic> _decodeIdToken(String token) {
+    final parts = token.split('.');
+    if (parts.length != 3) throw Exception('Invalid id token');
+    final payload = utf8.decode(
+        base64Url.decode(base64Url.normalize(parts[1])));
+    return Map<String, dynamic>.from(jsonDecode(payload));
+  }
+}
+
+/// Wraps Google Play Billing through the in_app_purchase plugin.
+/// Grants Pro on active purchases; monthly renewal is managed by Google Play.
+class BillingService {
+  static const String proMonthlyId = 'com.novustudio.habitflow.pro_monthly';
+
+  static BillingService? _instance;
+  static BillingService get instance => _instance ??= BillingService._();
+
+  final InAppPurchase _iap;
+  ProductDetails? _pro;
+  String? _lastError;
+  Completer<BillingOutcome>? _outcome;
+  bool _sawActivePro = false;
+
+  BillingService._() : _iap = InAppPurchase.instance {
+    _iap.purchaseStream.listen(_onPurchases, onError: (Object e) {
+      _lastError = '$e';
+      final c = _outcome;
+      if (c != null && !c.isCompleted) { c.complete(BillingOutcome.error); }
+    });
+  }
+
+  ProductDetails? get proProduct => _pro;
+  String? get lastError => _lastError;
+
+  Future<bool> available() async {
+    try { return await _iap.isAvailable(); } catch (_) { return false; }
+  }
+
+  Future<void> ensureProduct() async {
+    try {
+      final res = await _iap.queryProductDetails({proMonthlyId});
+      for (final p in res.productDetails) {
+        if (p.id == proMonthlyId) { _pro = p; break; }
+      }
+    } catch (e) { _lastError = '$e'; }
+  }
+
+  /// Grant pro when a monthly subscription is or was active.
+  Future<void> refreshSubscription() async {
+    try {
+      if (!await available()) return;
+      await ensureProduct();
+      await _iap.restorePurchases();
+    } catch (e) { _lastError = '$e'; }
+  }
+
+  Future<BillingOutcome> buyPro() async {
+    try {
+      if (!await available()) { return BillingOutcome.unavailable; }
+      await ensureProduct();
+      final details = _pro;
+      if (details == null) { return BillingOutcome.noProduct; }
+      final completer = Completer<BillingOutcome>();
+      _outcome = completer;
+      final ok = await _iap.buyNonConsumable(
+        purchaseParam: PurchaseParam(
+          productDetails: details,
+          applicationUserName: AuthService.email,
+        ),
+      );
+      if (!ok) {
+        _outcome = null;
+        return BillingOutcome.launchFailed;
+      }
+      return await completer.future;
+    } catch (e) {
+      _lastError = '$e';
+      return BillingOutcome.error;
+    }
+  }
+
+  Future<BillingOutcome> restore() async {
+    try {
+      if (!await available()) { return BillingOutcome.unavailable; }
+      _sawActivePro = AuthService.isProUser;
+      await _iap.restorePurchases();
+      await Future<void>.delayed(const Duration(seconds: 6));
+      final ok = _sawActivePro || AuthService.isProUser;
+      if (!ok && AuthService.proFromBilling) {
+        await AuthService.setProSourceBilling(false);
+        await AuthService.setPro(false);
+      }
+      return ok ? BillingOutcome.granted : BillingOutcome.canceled;
+    } catch (e) {
+      _lastError = '$e';
+      return BillingOutcome.error;
+    }
+  }
+
+  void _onPurchases(List<PurchaseDetails> details) {
+    final pending = <PurchaseDetails>[];
+    for (final d in details) {
+      if (d.status == PurchaseStatus.pending) {
+        pending.add(d);
+        continue;
+      }
+      if (d.status == PurchaseStatus.restored || d.status == PurchaseStatus.purchased) {
+        if (d.productID == proMonthlyId) {
+          _sawActivePro = true;
+          _grantPro(d);
+        }
+        continue;
+      }
+      if (d.status == PurchaseStatus.canceled) { _finish(BillingOutcome.canceled); continue; }
+      _lastError = '${d.error ?? 'Unknown purchase error'}';
+      _finish(BillingOutcome.error);
+    }
+    if (pending.isNotEmpty) { _finish(BillingOutcome.pending); }
+  }
+
+  Future<void> _grantPro(PurchaseDetails d) async {
+    await AuthService.setPro(true);
+    await AuthService.setProSourceBilling(true);
+    if (d.pendingCompletePurchase) {
+      try { await _iap.completePurchase(d); } catch (e) { _lastError = '$e'; }
+    }
+    _finish(BillingOutcome.granted);
+  }
+
+  void _finish(BillingOutcome outcome) {
+    final c = _outcome;
+    if (c != null && !c.isCompleted) { c.complete(outcome); }
+  }
+}
+
 /// Current time source. Tests override this to pin "today".
 DateTime Function() clock = DateTime.now;
-
-/// Calendar-day arithmetic. Adding a `Duration(days: n)` to a local DateTime
-/// adds n*24h, which lands on the wrong day across DST changes; building a new
-/// date from its components does not.
-DateTime addDays(DateTime d, int days) =>
-    DateTime(d.year, d.month, d.day + days);
 
 String dayKey(DateTime d) =>
     '${d.year}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
@@ -232,6 +550,11 @@ InputDecoration softInputDecoration(
   );
 }
 
+/// Transparent status bar with icons that contrast with the app background.
+SystemUiOverlayStyle overlayStyleFor(bool isDark) =>
+    (isDark ? SystemUiOverlayStyle.light : SystemUiOverlayStyle.dark)
+        .copyWith(statusBarColor: Colors.transparent);
+
 ThemeData _buildTheme(Color seed, Brightness b) {
   final isDark = b == Brightness.dark;
   final scheme = ColorScheme.fromSeed(
@@ -254,6 +577,9 @@ ThemeData _buildTheme(Color seed, Brightness b) {
     ),
     appBarTheme: AppBarTheme(
       backgroundColor: Colors.transparent,
+      // Transparent app bars cannot infer the status bar icon colour.
+      systemOverlayStyle:
+          overlayStyleFor(isDark),
       elevation: 0,
       scrolledUnderElevation: 0,
       centerTitle: false,
@@ -380,33 +706,48 @@ class _Blob extends StatelessWidget {
 class HabitFlowApp extends StatefulWidget {
   const HabitFlowApp({super.key});
 
-  // ignore: library_private_types_in_public_api
-  static _HabitFlowAppState? of(BuildContext context) =>
-      context.findAncestorStateOfType<_HabitFlowAppState>();
+  static HabitFlowAppState? of(BuildContext context) =>
+      context.findAncestorStateOfType<HabitFlowAppState>();
 
   @override
-  State<HabitFlowApp> createState() => _HabitFlowAppState();
+  State<HabitFlowApp> createState() => HabitFlowAppState();
 }
 
-class _HabitFlowAppState extends State<HabitFlowApp> {
+class HabitFlowAppState extends State<HabitFlowApp> {
   Color _seed = palette[0];
+  bool _customTheme = false;
   bool _darkMode = true;
   bool? _onboardingDone;
   String _lang = Language.code;
+  int _proEpoch = 0;
+
+  void refreshPro() => setState(() => _proEpoch++);
 
   @override
   void initState() {
     super.initState();
     _loadTheme();
+    _initBilling();
+  }
+
+  Future<void> _initBilling() async {
+    await BillingService.instance.refreshSubscription();
   }
 
   Future<void> _loadTheme() async {
     final prefs = await SharedPreferences.getInstance();
     final i = prefs.getInt('themeColor') ?? 0;
+    final custom = prefs.getInt('themeCustom');
     final dark = prefs.getBool('darkMode') ?? true;
     if (mounted) {
       setState(() {
-        _seed = palette[i.clamp(0, palette.length - 1)];
+        if (i < 0 && custom != null) {
+          _customTheme = true;
+          _seed = Color(custom);
+        } else {
+          _customTheme = false;
+          _seed = palette[i.clamp(0, palette.length - 1)];
+        }
         _darkMode = dark;
         _onboardingDone = prefs.getBool('onboarding_done') ?? false;
         _lang = Language.code;
@@ -415,9 +756,25 @@ class _HabitFlowAppState extends State<HabitFlowApp> {
   }
 
   void setTheme(int index) {
-    setState(() => _seed = palette[index.clamp(0, palette.length - 1)]);
-    SharedPreferences.getInstance()
-        .then((p) => p.setInt('themeColor', index));
+    setState(() {
+      _customTheme = false;
+      _seed = palette[index.clamp(0, palette.length - 1)];
+    });
+    SharedPreferences.getInstance().then((p) {
+      p.setInt('themeColor', index);
+      p.remove('themeCustom');
+    });
+  }
+
+  void setCustomTheme(Color color) {
+    setState(() {
+      _customTheme = true;
+      _seed = color;
+    });
+    SharedPreferences.getInstance().then((p) {
+      p.setInt('themeColor', -1);
+      p.setInt('themeCustom', color.toARGB32());
+    });
   }
 
   void setDarkMode(bool dark) {
@@ -447,14 +804,20 @@ class _HabitFlowAppState extends State<HabitFlowApp> {
       themeMode: _darkMode ? ThemeMode.dark : ThemeMode.light,
       builder: (context, child) {
         final cs = Theme.of(context).colorScheme;
-        return _AmbientBackground(
-          scheme: cs,
-          isDark: Theme.of(context).brightness == Brightness.dark,
-          child: child ?? const SizedBox.shrink(),
+        final isDark = Theme.of(context).brightness == Brightness.dark;
+        // Screens without an AppBar (home, onboarding, sign-in) need the
+        // status bar icon colour set here, or they stay white in light mode.
+        return AnnotatedRegion<SystemUiOverlayStyle>(
+          value: overlayStyleFor(isDark),
+          child: _AmbientBackground(
+            scheme: cs,
+            isDark: isDark,
+            child: child ?? const SizedBox.shrink(),
+          ),
         );
       },
       home: KeyedSubtree(
-        key: ValueKey(_lang),
+        key: ValueKey('$_lang-$_proEpoch'),
         child: (_onboardingDone ?? true) ? const RootPage() : const OnboardingPage(),
       ),
     );
@@ -471,6 +834,7 @@ class OnboardingPage extends StatefulWidget {
 class _OnboardingPageState extends State<OnboardingPage> {
   final PageController _controller = PageController();
   int _page = 0;
+  bool _applying = false;
 
   List<(IconData, String, String)> get _slides => [
     (
@@ -503,6 +867,238 @@ class _OnboardingPageState extends State<OnboardingPage> {
     );
   }
 
+  Future<void> _applyPack(StarterPack pack) async {
+    if (_applying) return;
+    setState(() => _applying = true);
+    final p = await SharedPreferences.getInstance();
+    final raw = p.getString('habits') ?? '[]';
+    final list = (jsonDecode(raw) as List)
+        .map((e) => Habit.fromMap(Map<String, dynamic>.from(e)))
+        .toList();
+    final room = AuthService.isProUser
+        ? pack.habits.length
+        : (3 - list.length).clamp(0, pack.habits.length);
+    var added = 0;
+    for (final ph in pack.habits) {
+      if (added >= room) break;
+      list.add(ph.toHabit(
+          id:
+              (DateTime.now().millisecondsSinceEpoch & 0x1FFFFFFF) + added));
+      added++;
+    }
+    await p.setString(
+        'habits', jsonEncode(list.map((h) => h.toMap()).toList()));
+    await p.setBool('onboarding_done', true);
+    refreshWidget();
+    if (!mounted) return;
+    final note = added == pack.habits.length
+        ? t('أضفنا ${pack.habits.length} عادات من حزمة ${t(pack.titleAr, pack.titleEn)} ✅',
+            'Added ${pack.habits.length} habits from the ${t(pack.titleAr, pack.titleEn)} pack ✅')
+        : t('أضفنا $added عادات — رقِّ لبرو بالتانية لأكثر.',
+            'Added $added habits — upgrade to Pro for more.');
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(note),
+        behavior: SnackBarBehavior.floating,
+        duration: const Duration(milliseconds: 1600),
+      ),
+    );
+    setState(() => _applying = false);
+    await Future<void>.delayed(const Duration(milliseconds: 450));
+    if (mounted) {
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(builder: (_) => const RootPage()),
+      );
+    }
+  }
+
+  Widget _buildPacks() {
+    return ListView(
+      padding: const EdgeInsets.symmetric(horizontal: 24),
+      children: [
+        const SizedBox(height: 12),
+        Text(
+          t('ابدأ بحياة 🌱', 'Start with a life 🌱'),
+          textAlign: TextAlign.center,
+          style: const TextStyle(fontSize: 26, fontWeight: FontWeight.bold),
+        ),
+        const SizedBox(height: 8),
+        Text(
+          t('اختار حزمة عادات جاهزة لحياتك — شيل اللي مش مناسبك.',
+              'Pick ready-made habit packs around the life you want — remove what does not fit.'),
+          textAlign: TextAlign.center,
+          style: TextStyle(color: Colors.grey.shade500, fontSize: 14, height: 1.5),
+        ),
+        const SizedBox(height: 18),
+        for (final pack in starterPacks)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 12),
+            child: Material(
+              color: Colors.transparent,
+              child: InkWell(
+                borderRadius: BorderRadius.circular(20),
+                onTap: () => _showPackSheet(pack),
+                child: Ink(
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: cardColor(Theme.of(context).brightness),
+                    borderRadius: BorderRadius.circular(20),
+                    border: Border.all(color: pack.color.withAlpha(80), width: 1.2),
+                  ),
+                  child: Row(
+                    children: [
+                      Container(
+                        width: 52,
+                        height: 52,
+                        decoration: BoxDecoration(
+                          color: pack.color.withAlpha(32),
+                          shape: BoxShape.circle,
+                        ),
+                        child: Icon(pack.icon, color: pack.color, size: 28),
+                      ),
+                      const SizedBox(width: 14),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(t(pack.titleAr, pack.titleEn),
+                                style: const TextStyle(
+                                    fontSize: 17, fontWeight: FontWeight.bold)),
+                            const SizedBox(height: 2),
+                            Text(
+                              t('${pack.habits.length} عادات جاهزة',
+                                  '${pack.habits.length} ready habits'),
+                              style: TextStyle(
+                                  color: Colors.grey.shade500, fontSize: 12),
+                            ),
+                          ],
+                        ),
+                      ),
+                      const Icon(Icons.chevron_right, color: Colors.grey),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        const SizedBox(height: 8),
+      ],
+    );
+  }
+
+  Future<void> _showPackSheet(StarterPack pack) async {
+    final selected = List<bool>.filled(pack.habits.length, true);
+    final added = await showModalBottomSheet<bool>(
+      context: context,
+      backgroundColor: cardColor(Theme.of(context).brightness),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(26)),
+      ),
+      isScrollControlled: true,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setSheetState) => Padding(
+          padding: EdgeInsets.only(
+            bottom: MediaQuery.of(ctx).viewInsets.bottom,
+          ),
+          child: SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(22, 20, 22, 18),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Container(
+                        width: 46,
+                        height: 46,
+                        decoration: BoxDecoration(
+                          color: pack.color.withAlpha(32),
+                          shape: BoxShape.circle,
+                        ),
+                        child: Icon(pack.icon, color: pack.color, size: 24),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Text(t(pack.titleAr, pack.titleEn),
+                            style: const TextStyle(
+                                fontSize: 20, fontWeight: FontWeight.bold)),
+                      ),
+                      IconButton(
+                        icon: const Icon(Icons.close),
+                        onPressed: () => Navigator.pop(ctx, false),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    t('حافظ على اللي يناسبك · اضغط لإزالته',
+                        'Keep what fits · tap to remove'),
+                    style: TextStyle(color: Colors.grey.shade500, fontSize: 13),
+                  ),
+                  const SizedBox(height: 12),
+                  for (var i = 0; i < pack.habits.length; i++)
+                    CheckboxListTile(
+                      value: selected[i],
+                      dense: true,
+                      contentPadding: EdgeInsets.zero,
+                      activeColor: pack.color,
+                      controlAffinity: ListTileControlAffinity.leading,
+                      title: Text(t(pack.habits[i].nameAr, pack.habits[i].nameEn),
+                          style: const TextStyle(fontSize: 14)),
+                      onChanged: (v) =>
+                          setSheetState(() => selected[i] = v ?? true),
+                    ),
+                  const SizedBox(height: 16),
+                  SizedBox(
+                    width: double.infinity,
+                    child: FilledButton(
+                      style: FilledButton.styleFrom(backgroundColor: pack.color),
+                      onPressed: _applying
+                          ? null
+                          : () => Navigator.pop(ctx, selected.any((s) => s)),
+                      child: Padding(
+                        padding: const EdgeInsets.all(12),
+                        child: Text(
+                          t('أضف العادات المختارة', 'Add selected habits'),
+                          style: const TextStyle(fontSize: 16),
+                        ),
+                      ),
+                    ),
+                  ),
+                  if (_applying)
+                    const Padding(
+                      padding: EdgeInsets.only(top: 12),
+                      child: Center(
+                          child: SizedBox(
+                              width: 22,
+                              height: 22,
+                              child: CircularProgressIndicator(strokeWidth: 2))),
+                    ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    if (added != true) return;
+    final kept = <PackHabit>[
+      for (var i = 0; i < pack.habits.length; i++)
+        if (selected[i]) pack.habits[i],
+    ];
+    if (kept.isEmpty) return;
+    final filtered = StarterPack(
+      titleAr: pack.titleAr,
+      titleEn: pack.titleEn,
+      icon: pack.icon,
+      color: pack.color,
+      habits: kept,
+    );
+    await _applyPack(filtered);
+  }
+
   @override
   Widget build(BuildContext context) {
     final primary = Theme.of(context).colorScheme.primary;
@@ -511,7 +1107,7 @@ class _OnboardingPageState extends State<OnboardingPage> {
         child: Column(
           children: [
             Align(
-              alignment: Alignment.centerRight,
+              alignment: AlignmentDirectional.centerEnd,
               child: TextButton(
                 onPressed: _done,
                 child: Text(t('تخطّي', 'Skip')),
@@ -520,9 +1116,10 @@ class _OnboardingPageState extends State<OnboardingPage> {
             Expanded(
               child: PageView.builder(
                 controller: _controller,
-                itemCount: _slides.length,
+                itemCount: _slides.length + 1,
                 onPageChanged: (i) => setState(() => _page = i),
                 itemBuilder: (ctx, i) {
+                  if (i == _slides.length) return _buildPacks();
                   final s = _slides[i];
                   return Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 32),
@@ -558,38 +1155,41 @@ class _OnboardingPageState extends State<OnboardingPage> {
                 },
               ),
             ),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: List.generate(
-                _slides.length,
-                (i) => AnimatedContainer(
-                  duration: const Duration(milliseconds: 200),
-                  margin: const EdgeInsets.symmetric(horizontal: 4),
-                  width: _page == i ? 22 : 8,
-                  height: 8,
-                  decoration: BoxDecoration(
-                    color: _page == i ? primary : Colors.grey.shade600,
-                    borderRadius: BorderRadius.circular(4),
+            if (_page < _slides.length)
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: List.generate(
+                  _slides.length,
+                  (i) => AnimatedContainer(
+                    duration: const Duration(milliseconds: 200),
+                    margin: const EdgeInsets.symmetric(horizontal: 4),
+                    width: _page == i ? 22 : 8,
+                    height: 8,
+                    decoration: BoxDecoration(
+                      color: _page == i ? primary : Colors.grey.shade600,
+                      borderRadius: BorderRadius.circular(4),
+                    ),
                   ),
                 ),
               ),
-            ),
             Padding(
               padding: const EdgeInsets.all(24),
               child: SizedBox(
                 width: double.infinity,
                 height: 52,
                 child: FilledButton(
-                  onPressed: () {
-                    if (_page < _slides.length - 1) {
-                      _controller.nextPage(
-                        duration: const Duration(milliseconds: 300),
-                        curve: Curves.easeOut,
-                      );
-                    } else {
-                      _done();
-                    }
-                  },
+                  onPressed: _applying
+                      ? null
+                      : () {
+                          if (_page < _slides.length) {
+                            _controller.nextPage(
+                              duration: const Duration(milliseconds: 300),
+                              curve: Curves.easeOut,
+                            );
+                          } else {
+                            _done();
+                          }
+                        },
                   child: Text(_page < _slides.length - 1
                       ? t('متابعة', 'Continue')
                       : t('ابدأ الآن 🚀', 'Get started 🚀')),
@@ -670,7 +1270,7 @@ class _AuthPageState extends State<AuthPage> {
         : passText.isEmpty;
     if (!AuthService.isValidEmail(emailText) || passTooShort) {
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text(t('أدخل بريداً صحيحاً وكلمة مرور (٦ حروف فأكثر)',
+          content: Text(t('أدخل بريداً صحيحاً وكلمة مرور (6 حروف فأكثر)',
               'Enter a valid email and a password (6+ characters)'))));
       return;
     }
@@ -705,6 +1305,66 @@ class _AuthPageState extends State<AuthPage> {
     if (mounted) {
       Navigator.pushReplacement(
 context,
+          MaterialPageRoute(builder: (_) => const MainShell()));
+    }
+  }
+
+  Future<void> _socialSignIn(String provider) async {
+    setState(() => _loading = true);
+    try {
+      final info = await SocialAuth.signIn(provider);
+      if (info == null) {
+        if (mounted) {
+          setState(() => _loading = false);
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+              content: Text(t('تم إلغاء تسجيل الدخول.',
+                  'Sign-in was cancelled.'))));
+        }
+        return;
+      }
+      await AuthService.socialLogin(
+          provider: info.provider, name: info.name, email: info.email);
+      await AuthService.logout();
+      await AuthService.startSession();
+      if (mounted) {
+        Navigator.pushReplacement(context,
+            MaterialPageRoute(builder: (_) => const MainShell()));
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _loading = false);
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content: Text(t(
+                'تعذر تسجيل الدخول بهذا الحساب — تأكد من إعدادات المزود.',
+                'Could not sign in with this account — check provider settings.'))));
+      }
+    }
+  }
+
+  Widget _googleIcon() {
+    return Container(
+      width: 20,
+      height: 20,
+      alignment: Alignment.center,
+      child: const Text('G',
+          style: TextStyle(
+              fontSize: 16,
+              fontWeight: FontWeight.bold,
+              color: Color(0xFF4285F4))),
+    );
+  }
+
+  Future<void> _fakeGoogleTest() async {
+    setState(() => _loading = true);
+    await AuthService.socialLogin(
+      provider: 'google',
+      name: 'Test Google',
+      email: 'testGoogle@habitflow.app',
+    );
+    await AuthService.logout();
+    await AuthService.startSession();
+    if (mounted) {
+      Navigator.pushReplacement(context,
           MaterialPageRoute(builder: (_) => const MainShell()));
     }
   }
@@ -819,7 +1479,87 @@ context,
                     ],
                   ),
                 ),
-                const SizedBox(height: 20),
+                if (SocialConfig.anyConfigured) ...[
+                  const SizedBox(height: 20),
+                  Row(
+                    children: [
+                      const Expanded(child: Divider()),
+                      Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 12),
+                        child: Text(t('أو تابع بـ', 'Or continue with'),
+                            style: TextStyle(
+                                color: Colors.grey.shade500, fontSize: 13)),
+                      ),
+                      const Expanded(child: Divider()),
+                    ],
+                  ),
+                  const SizedBox(height: 20),
+                ],
+                if (SocialConfig.anyConfigured)
+                  Row(
+                  children: [
+                    if (SocialConfig.isConfigured('google')) ...[
+                      Expanded(
+                        child: _SocialButton(
+                          icon: _googleIcon(),
+                          label: 'Google',
+                          onTap: _loading ? null : () => _socialSignIn('google'),
+                        ),
+                      ),
+                      if (SocialConfig.isConfigured('facebook'))
+                        const SizedBox(width: 12),
+                    ],
+                    if (SocialConfig.isConfigured('facebook'))
+                      Expanded(
+                        child: _SocialButton(
+                          icon: Container(
+                            width: 20,
+                            height: 20,
+                            decoration: const BoxDecoration(
+                              shape: BoxShape.circle,
+                              color: Color(0xFF1877F2),
+                            ),
+                            alignment: Alignment.center,
+                            child: const Icon(Icons.facebook,
+                                color: Colors.white, size: 14),
+                          ),
+                          label: 'Facebook',
+                          onTap: _loading ? null : () => _socialSignIn('facebook'),
+                        ),
+                      ),
+                  ],
+                ),
+                if (SocialConfig.isConfigured('microsoft')) ...[
+                  const SizedBox(height: 12),
+                  SizedBox(
+                    width: double.infinity,
+                    child: _SocialButton(
+                      icon: Container(
+                        width: 20,
+                        height: 20,
+                        decoration: const BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: Color(0xFF0078D4),
+                        ),
+                        alignment: Alignment.center,
+                        child: const Icon(Icons.mail, color: Colors.white, size: 13),
+                      ),
+                      label: t('أوتلوك', 'Outlook'),
+                      onTap: _loading ? null : () => _socialSignIn('microsoft'),
+                    ),
+                  ),
+                ],
+                if (kDebugMode) ...[
+                  const SizedBox(height: 12),
+                  TextButton.icon(
+                    onPressed: _loading ? null : _fakeGoogleTest,
+                    icon: const Icon(Icons.science_outlined, size: 18),
+                    label: Text(t(
+                        'دخول اختباري (محاكاة جوجل)',
+                        'Test login (simulated Google)')),
+                  ),
+                ],
+                const SizedBox(height: 8),
                 TextButton(
                   onPressed: () => setState(() => _isSignup = !_isSignup),
                   child: Text(_isSignup
@@ -828,10 +1568,70 @@ context,
                       : t('جديد هنا؟ أنشئ حسابك', 'New here? Create an account')),
                 ),
                 const SizedBox(height: 12),
-                Text('HabitFlow v1.2',
+                TextButton(
+                  onPressed: () => launchUrl(
+                    Uri.parse(
+                        'https://zeyad-muhammed.github.io/novu-site/habitflow/privacy-policy/'),
+                    mode: LaunchMode.externalApplication,
+                  ),
+                  child: Text(
+                    t('سياسة الخصوصية', 'Privacy Policy'),
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.primary,
+                      decoration: TextDecoration.underline,
+                      fontSize: 13,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text('HabitFlow v1.0.3',
                     style: TextStyle(color: Colors.grey.shade700, fontSize: 12)),
               ],
             ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _SocialButton extends StatelessWidget {
+  const _SocialButton(
+      {required this.icon, required this.label, this.onTap});
+
+  final Widget icon;
+  final String label;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final brightness = Theme.of(context).brightness;
+    return Material(
+      color: cardColor(brightness),
+      borderRadius: BorderRadius.circular(12),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(12),
+        onTap: onTap,
+        child: Container(
+          height: 48,
+          padding: const EdgeInsets.symmetric(horizontal: 12),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(12),
+            border:
+                Border.all(color: Colors.grey.withValues(alpha: 0.35)),
+          ),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              icon,
+              const SizedBox(width: 10),
+              Flexible(
+                child: Text(label,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                        fontSize: 14, fontWeight: FontWeight.w600)),
+              ),
+            ],
           ),
         ),
       ),
@@ -916,7 +1716,7 @@ class _ResetPasswordPageState extends State<ResetPasswordPage> {
   Future<void> _saveNewPassword() async {
     final pass = _newPass.text;
     if (pass.length < AuthService.minPasswordLength) {
-      _toast(t('الباسورد لازم ٦ حروف فأكثر', 'Password must be 6+ characters'));
+      _toast(t('الباسورد لازم 6 حروف فأكثر', 'Password must be 6+ characters'));
       return;
     }
     if (pass != _confirm.text) {
@@ -959,7 +1759,9 @@ class _ResetPasswordPageState extends State<ResetPasswordPage> {
             child: Column(
               children: [
                 Image.asset(
-                  'assets/icon/logo_white.png',
+                  brightness == Brightness.dark
+                      ? 'assets/icon/logo_white.png'
+                      : 'assets/icon/logo_black.png',
                   height: 72,
                 ),
                 const SizedBox(height: 20),
@@ -1017,7 +1819,7 @@ class _ResetPasswordPageState extends State<ResetPasswordPage> {
                               letterSpacing: 6),
                           decoration: softInputDecoration(
                             context,
-                            label: t('كود من ٦ أرقام', '6-digit code'),
+                            label: t('كود من 6 أرقام', '6-digit code'),
                             prefix: const Icon(Icons.pin_outlined),
                           ),
                         ),
@@ -1095,7 +1897,7 @@ Future<void> notificationBackgroundHandler(NotificationResponse response) async 
   await NotificationService.handleResponse(response);
 }
 
-const MethodChannel _widgetChannel = MethodChannel('com.zeyad.habit_tracker/widget');
+const MethodChannel _widgetChannel = MethodChannel('com.novu.HabitFlow/widget');
 
 void refreshWidget() {
   // The channel only exists on Android while the activity is running (not in
@@ -1298,6 +2100,8 @@ class Habit {
   bool reminderEnabled;
   int? reminderHour;
   int? reminderMinute;
+  bool isTimer;
+  int timerMinutes;
   Map<String, double> amounts;
   Map<String, String> doneAt;
 
@@ -1315,6 +2119,8 @@ class Habit {
     this.reminderEnabled = false,
     this.reminderHour,
     this.reminderMinute,
+    this.isTimer = false,
+    this.timerMinutes = 5,
     Map<String, double>? amounts,
     Map<String, String>? doneAt,
   })  : id = id ?? (clock().millisecondsSinceEpoch & 0x1FFFFFFF),
@@ -1338,7 +2144,7 @@ class Habit {
     doneAt[k] = d.toIso8601String();
   }
 
-  static const List<IconData> availableIcons = [
+  static const List<IconData> basicIcons = [
     Icons.fitness_center,
     Icons.menu_book,
     Icons.water_drop,
@@ -1351,10 +2157,76 @@ class Habit {
     Icons.brush,
   ];
 
+  static const List<IconData> extraIcons = [
+    Icons.school_rounded,
+    Icons.work_rounded,
+    Icons.savings_rounded,
+    Icons.attach_money_rounded,
+    Icons.shopping_cart_rounded,
+    Icons.shopping_bag_rounded,
+    Icons.restaurant_rounded,
+    Icons.local_cafe_rounded,
+    Icons.cake_rounded,
+    Icons.celebration_rounded,
+    Icons.eco_rounded,
+    Icons.park_rounded,
+    Icons.forest_rounded,
+    Icons.terrain_rounded,
+    Icons.wb_sunny_rounded,
+    Icons.nights_stay_rounded,
+    Icons.bed_rounded,
+    Icons.alarm_rounded,
+    Icons.no_food_rounded,
+    Icons.smoke_free_rounded,
+    Icons.vaccines_rounded,
+    Icons.medication_rounded,
+    Icons.favorite_rounded,
+    Icons.psychology_rounded,
+    Icons.smartphone_rounded,
+    Icons.laptop_mac_rounded,
+    Icons.headphones_rounded,
+    Icons.movie_rounded,
+    Icons.videogame_asset_rounded,
+    Icons.theater_comedy_rounded,
+    Icons.draw_rounded,
+    Icons.palette_rounded,
+    Icons.camera_alt_rounded,
+    Icons.language_rounded,
+    Icons.translate_rounded,
+    Icons.volunteer_activism_rounded,
+    Icons.handshake_rounded,
+    Icons.groups_rounded,
+    Icons.family_restroom_rounded,
+    Icons.clean_hands_rounded,
+    Icons.shower_rounded,
+    Icons.face_rounded,
+    Icons.spa_rounded,
+    Icons.accessibility_new_rounded,
+    Icons.emoji_events_rounded,
+    Icons.water_rounded,
+    Icons.coffee_rounded,
+    Icons.self_improvement_rounded,
+    Icons.music_note_rounded,
+    Icons.fitness_center_rounded,
+    Icons.hiking_rounded,
+    Icons.directions_run_rounded,
+    Icons.sports_soccer_rounded,
+    Icons.sports_basketball_rounded,
+    Icons.directions_bike_rounded,
+    Icons.pool_rounded,
+    Icons.pets_rounded,
+  ];
+
+  static final List<IconData> availableIcons = [
+    ...basicIcons,
+    ...extraIcons,
+  ];
+
   IconData get icon =>
       availableIcons[iconIndex.clamp(0, availableIcons.length - 1)];
 
   bool get isMeasurable => target > 0;
+  bool get isTimerHabit => isTimer;
   bool get isWeekly => frequency == 1;
   bool get isFlexible => frequency == 2;
   bool get isDaily => frequency == 0;
@@ -1484,6 +2356,66 @@ class Habit {
     return best;
   }
 
+  /// الحلقة الهادئة: فقدت يوم مستحق قبل هذا اليوم ثم عدت اليوم.
+  DateTime? _previousDueBefore(DateTime day) {
+    var prev = addDays(day, -1);
+    while (!prev.isBefore(addDays(_earliest(), -1))) {
+      if (isDueOn(prev)) return prev;
+      prev = addDays(prev, -1);
+    }
+    return null;
+  }
+
+  bool isComebackOn(DateTime day) {
+    if (!isDoneOn(day)) return false;
+    final prev = _previousDueBefore(day);
+    if (prev == null) return false;
+    if (isDoneOn(prev)) return false;
+    var wasActiveBefore = false;
+    for (var d = _earliest(); !d.isAfter(prev); d = addDays(d, 1)) {
+      if (isDueOn(d) && isDoneOn(d)) {
+        wasActiveBefore = true;
+        break;
+      }
+    }
+    return wasActiveBefore;
+  }
+
+  int countComebacks() {
+    final doneKeys = <String>{
+      if (!isMeasurable) ...completedDates,
+      ...amounts.keys.where((k) => (amounts[k] ?? 0) >= target),
+    };
+    var count = 0;
+    for (final k in doneKeys) {
+      try {
+        if (isComebackOn(parseDayKey(k))) count++;
+      } catch (_) {}
+    }
+    return count;
+  }
+
+  /// إجمالي الأيام التي أُنجِز فيها شيء ما (عبر كل العادات).
+  static int activeDaysOf(List<Habit> habits) {
+    final days = <String>{};
+    for (final h in habits) {
+      if (h.isMeasurable) {
+        days.addAll(h.amounts.keys.where((k) => (h.amounts[k] ?? 0) >= h.target));
+      } else {
+        days.addAll(h.completedDates);
+      }
+    }
+    return days.length;
+  }
+
+  /// أقدم تاريخ لها (من أي يوم إنجاز في أي مصدر).
+  DateTime? earliestEver() {
+    if (!isMeasurable && completedDates.isEmpty && amounts.keys.isEmpty) {
+      return null;
+    }
+    return _earliest();
+  }
+
   int get numberOfStreaks {
     int weeks = 0;
     int run = 0;
@@ -1554,6 +2486,8 @@ class Habit {
         'reminderEnabled': reminderEnabled,
         'reminderHour': reminderHour,
         'reminderMinute': reminderMinute,
+        'isTimer': isTimer,
+        'timerMinutes': timerMinutes,
         'amounts': amounts,
         'doneAt': doneAt,
       };
@@ -1574,6 +2508,8 @@ class Habit {
         reminderEnabled: map['reminderEnabled'] ?? false,
         reminderHour: map['reminderHour'],
         reminderMinute: map['reminderMinute'],
+        isTimer: map['isTimer'] ?? false,
+        timerMinutes: map['timerMinutes'] ?? 5,
         amounts: map['amounts'] != null
             ? Map<String, double>.from(
                 (map['amounts'] as Map).map((k, v) =>
@@ -1743,6 +2679,20 @@ List<({int year, int month, String label, double rate})> monthSeries(
   return out;
 }
 
+double dayRate(List<Habit> habits, DateTime d) {
+  if (habits.isEmpty) return 0;
+  final done = habits.where((h) => h.isDoneOn(d)).length;
+  return done / habits.length * 100;
+}
+
+Color heatColor(double rate, Color primary, Color bg) {
+  if (rate <= 0.0001) return bg;
+  final alpha = (24 + rate * 2.2).round().clamp(24, 255);
+  return primary.withAlpha(alpha);
+}
+
+bool sameDay(DateTime a, DateTime b) => dayKey(a) == dayKey(b);
+
 List<String> buildInsights(List<Habit> habits) {
   final out = <String>[];
   final today = clock();
@@ -1765,7 +2715,7 @@ List<String> buildInsights(List<Habit> habits) {
 
   final hot = habits.where((h) => h.currentStreak() >= 7).toList();
   if (hot.isNotEmpty) {
-    out.add(t('🔥 ${hot.length} عادة بسلسلة نشطة ${hot.first.currentStreak()}+ يوم.',
+    out.add(t('🔥 ${hot.length} عادة بسلسلة نشطة ${ltr('${hot.first.currentStreak()}+')} يوم.',
         '🔥 ${hot.length} habit(s) with an active ${hot.first.currentStreak()}+ day streak.'));
   }
 
@@ -1778,7 +2728,7 @@ List<String> buildInsights(List<Habit> habits) {
           ? (h.target * 1.5).roundToDouble()
           : (h.target + h.target * 0.25).roundToDouble();
       out.add(t(
-          '📈 تتقن "${h.name}" — جرّب رفع الهدف إلى $suggested ${h.unit.trim()} للارتقاء بمستواك.',
+          '📈 تتقن "${iso(h.name)}" — جرّب رفع الهدف إلى ${ltr('$suggested')} ${h.unit.trim()} للارتقاء بمستواك.',
           '📈 You master "${h.name}" — try raising the goal to $suggested ${h.unit.trim()} to level up.'));
       break;
     }
@@ -1787,7 +2737,7 @@ List<String> buildInsights(List<Habit> habits) {
   final down = habits.where((h) => h.isDueOn(today) &&
       h.rateLastN(7) < 40 && h.countCompletions() >= 10).toList();
   if (down.isNotEmpty) {
-    out.add(t('⚠️ "${down.first.name}" هادئة هذا الأسبوع — اهتم بأفضل عاداتك أولاً.',
+    out.add(t('⚠️ "${iso(down.first.name)}" هادئة هذا الأسبوع — اهتم بأفضل عاداتك أولاً.',
         '⚠️ "${down.first.name}" is quiet this week — focus on your best habits first.'));
   }
 
@@ -1872,46 +2822,77 @@ class BadgeSystem {
         t('أنشئ أول عادة لك', 'Create your first habit'),
         (h, l, x) => h.isNotEmpty),
     Badge('fire7', Icons.local_fire_department, t('على نار', 'On Fire'),
-        t('حقق سلسلة ٧ أيام', 'Reach a 7-day streak'),
+        t('حقق سلسلة 7 أيام', 'Reach a 7-day streak'),
         (h, l, x) => h.any((hb) => hb.longestStreak() >= 7)),
     Badge('bolt30', Icons.bolt, t('لا يُوقف', 'Unstoppable'),
-        t('حقق سلسلة ٣٠ يوماً', 'Reach a 30-day streak'),
+        t('حقق سلسلة 30 يوماً', 'Reach a 30-day streak'),
         (h, l, x) => h.any((hb) => hb.longestStreak() >= 30)),
     Badge('century', Icons.star, t('مئة إنجاز', 'Century'),
-        t('أنجز ١٠٠ عادة إجمالاً', 'Complete 100 habits in total'),
+        t('أنجز 100 عادة إجمالاً', 'Complete 100 habits in total'),
         (h, l, x) => h.fold<int>(0, (s, hb) => s + hb.countCompletions()) >= 100),
     Badge('perfectday', Icons.today, t('يوم مثالي', 'Perfect Day'),
         t('أنجز كل عاداتك في يوم واحد', 'Complete every habit in one day'),
         (h, l, x) => _perfectDayEver(h)),
     Badge('perfectweek', Icons.workspace_premium, t('أسبوع مثالي', 'Perfect Week'),
-        t('أنهي كل عاداتك ٧ أيام متتالية', 'Complete all habits 7 days in a row'),
+        t('أنهي كل عاداتك 7 أيام متتالية', 'Complete all habits 7 days in a row'),
         (h, l, x) => _perfectWeekEver(h)),
     Badge('level5', Icons.auto_awesome, t('نجم صاعد', 'Rising Star'),
-        t('صل للمستوى ٥', 'Reach level 5'),
+        t('صل للمستوى 5', 'Reach level 5'),
         (h, l, x) => l >= 5),
     Badge('level10', Icons.military_tech, t('سيد العادات', 'Habit Master'),
-        t('صل للمستوى ١٠', 'Reach level 10'),
+        t('صل للمستوى 10', 'Reach level 10'),
         (h, l, x) => l >= 10),
     Badge('measured', Icons.straighten, t('قابل للقياس', 'Measurable'),
         t('أنجز عادة قابلة للقياس', 'Complete a measurable habit'),
         (h, l, x) => h.any((hb) => hb.isMeasurable && hb.countCompletions() > 0)),
     Badge('consistent', Icons.rule, t('ثابت', 'Consistent'),
-        t('نجاح ٨٠٪+ خلال ٣٠ يوماً', '80%+ success over 30 days'),
+        t('نجاح 80%+ خلال 30 يوماً', '80%+ success over 30 days'),
         (h, l, x) => h.any((hb) => hb.countCompletions() > 0 && hb.rateLastN(30) >= 80)),
     Badge('clean7', Icons.eco, t('سلسلة نقية', 'Clean Streak'),
-        t('٧ أيام نقية على عادة إقلاع', '7 clean days on a quit habit'),
+        t('7 أيام نقية على عادة إقلاع', '7 clean days on a quit habit'),
         (h, l, x) => h.where((hb) => hb.isQuit).fold<int>(0, (m, hb) => m > hb.longestStreak() ? m : hb.longestStreak()) >= 7),
     Badge('scholar', Icons.school, t('عالِم', 'Scholar'),
-        t('أنجز ١٠ أهداف قابلة للقياس', 'Complete 10 measurable goals'),
+        t('أنجز 10 أهداف قابلة للقياس', 'Complete 10 measurable goals'),
         (h, l, x) => h.fold<int>(0, (s, hb) => s + (hb.isMeasurable ? hb.countCompletions() : 0)) >= 10),
-    Badge('runner', Icons.flag, t('نادي ١٠٠', '100 Club'),
-        t('أنجز ١٠٠ تسجيلاً هذا الأسبوع', 'Complete 100 logs this week'),
+    Badge('runner', Icons.flag, t('نادي 100', '100 Club'),
+        t('أنجز 100 تسجيلاً هذا الأسبوع', 'Complete 100 logs this week'),
         (h, l, x) => _hundredWeek(h)),
     Badge('focus', Icons.filter_center_focus, t('تركيز كامل', 'Full Focus'),
         t('أنجز أسبوعاً مثالياً في عادة واحدة', 'Complete a perfect week on one habit'),
         (h, l, x) => _singlePerfectWeek(h)),
     Badge('pro', Icons.workspace_premium, t('داعم برو', 'Pro Supporter'),
         t('فعّل برو', 'Activate Pro'), (h, l, x) => AuthService.isProUser),
+    Badge('first_week', Icons.weekend, t('أسبوع كامل 🌱', 'First week 🌱'),
+        t('سبعة أيام اعتياد — أساسك اتبني', 'Seven days with your plan — the foundation is real'),
+        (h, l, x) => Habit.activeDaysOf(h) >= 7),
+    Badge('first_comeback', Icons.settings_backup_restore, t('أول عودة 🔥', 'First comeback 🔥'),
+        t('رجعت بعد فترة هدوء — دي تحسب أكتر من أي سلسلة',
+            'You returned after a quiet stretch — that counts more than any streak'),
+        (h, l, x) => h.any((hb) => hb.countComebacks() >= 1)),
+    Badge('new_record', Icons.star_border_purple500, t('ريكورد جديد 📈', 'New personal record 📈'),
+        t('وصول لأطول سلسلة 21 يوماً', 'Reach a 21-day personal best run'),
+        (h, l, x) => h.fold<int>(0, (s, hb) => s > hb.longestStreak() ? s : hb.longestStreak()) >= 21),
+    Badge('active100', Icons.calendar_month, t('100 يوم نشاط 💯', '100 active days 💯'),
+        t('مئة يوم ظهرت فيها لعادة واحدة على الأقل',
+            'One hundred days in which you showed up for at least one habit'),
+        (h, l, x) => Habit.activeDaysOf(h) >= 100),
+    Badge('mastery', Icons.workspace_premium, t('إتقان عادة 🏔️', 'Habit mastery 🏔️'),
+        t('ستة أشهر مع "أول عادة لك" — الالتزام بقى جزء منك',
+            'Six months with a habit — it is part of you now'),
+        (h, l, x) => h.any((hb) {
+              final first = hb.earliestEver();
+              if (first == null) return false;
+              return DateTime.now().difference(first).inDays >= 180 &&
+                  hb.countCompletions() >= 100;
+            })),
+    Badge('journey1y', Icons.route, t('رحلة سنة 🕰️', 'One-year journey 🕰️'),
+        t('سنة كاملة من أول إنجاز لك — شوف اتنينت قد إيه!',
+            'A full year since your first log — look how far the map goes'),
+        (h, l, x) => h.any((hb) {
+              final first = hb.earliestEver();
+              if (first == null) return false;
+              return DateTime.now().difference(first).inDays >= 365;
+            })),
   ];
 
   static bool _perfectDayEver(List<Habit> habits) {
@@ -1988,6 +2969,118 @@ class BadgeSystem {
   }
 }
 
+// ---------- Starter packs (onboarding templates) ----------
+
+class PackHabit {
+  final String nameAr;
+  final String nameEn;
+  final int iconIndex;
+  final int frequency;
+  final int timesPerWeek;
+  final double target;
+  final String unit;
+  final bool isQuit;
+
+  const PackHabit({
+    required this.nameAr,
+    required this.nameEn,
+    required this.iconIndex,
+    this.frequency = 0,
+    this.timesPerWeek = 3,
+    this.target = 0,
+    this.unit = '',
+    this.isQuit = false,
+  });
+
+  Habit toHabit({int? id}) => Habit(
+        name: t(nameAr, nameEn),
+        iconIndex: iconIndex,
+        frequency: frequency,
+        timesPerWeek: timesPerWeek,
+        target: target,
+        unit: unit,
+        isQuit: isQuit,
+        id: id,
+      );
+}
+
+class StarterPack {
+  final String titleAr;
+  final String titleEn;
+  final IconData icon;
+  final Color color;
+  final List<PackHabit> habits;
+
+  const StarterPack({
+    required this.titleAr,
+    required this.titleEn,
+    required this.icon,
+    required this.color,
+    required this.habits,
+  });
+}
+
+const starterPacks = [
+  StarterPack(
+    titleAr: 'العافية',
+    titleEn: 'Wellness',
+    icon: Icons.eco,
+    color: Color(0xFF2EBD85),
+    habits: [
+      PackHabit(nameAr: 'اشرب ماية 8 أكواب 💧', nameEn: 'Drink 8 glasses of water',
+        iconIndex: 2, target: 8, unit: 'كوب'),
+      PackHabit(nameAr: 'مشي يومي 🚶', nameEn: 'Daily walk', iconIndex: 6),
+      PackHabit(nameAr: 'النوم قبل 11 🛌', nameEn: 'Sleep by 11', iconIndex: 4),
+      PackHabit(nameAr: 'رياضة 3 مرات/أسبوع 🏋️', nameEn: 'Workout 3×/week',
+        iconIndex: 0, frequency: 2, timesPerWeek: 3),
+    ],
+  ),
+  StarterPack(
+    titleAr: 'التعلّم',
+    titleEn: 'Learning',
+    icon: Icons.menu_book,
+    color: Color(0xFF4C7CFF),
+    habits: [
+      PackHabit(nameAr: 'اقرأ 10 صفحات 📖', nameEn: 'Read 10 pages',
+        iconIndex: 1, target: 10, unit: 'صفحة'),
+      PackHabit(nameAr: '5 دقايق إنجليزي 🇬🇧', nameEn: '5 min language practice',
+        iconIndex: 3, target: 5, unit: 'دقيقة'),
+      PackHabit(nameAr: 'مذاكرة 25 دقيقة 🎯', nameEn: '25 min deep work',
+        iconIndex: 5, target: 25, unit: 'دقيقة'),
+      PackHabit(nameAr: 'مذكرات يومية ✍️', nameEn: 'Daily journal', iconIndex: 8),
+    ],
+  ),
+  StarterPack(
+    titleAr: 'الرياضة',
+    titleEn: 'Sports',
+    icon: Icons.fitness_center,
+    color: Color(0xFFFF8A3D),
+    habits: [
+      PackHabit(nameAr: 'تمرين 3 مرات/أسبوع 🏋️', nameEn: 'Workout 3×/week',
+        iconIndex: 0, frequency: 2, timesPerWeek: 3),
+      PackHabit(nameAr: 'إطالة يومية 🤸', nameEn: 'Daily stretching', iconIndex: 3),
+      PackHabit(nameAr: '10 آلاف خطوة 👟', nameEn: '10k steps',
+        iconIndex: 6, target: 10000, unit: 'خطوة'),
+      PackHabit(nameAr: 'أكواب ميادة 💧', nameEn: 'Drink water',
+        iconIndex: 2, target: 8, unit: 'كوب'),
+    ],
+  ),
+  StarterPack(
+    titleAr: 'الإسلامية',
+    titleEn: 'Islamic',
+    icon: Icons.mosque,
+    color: Color(0xFF7C6AE8),
+    habits: [
+      PackHabit(nameAr: 'صلاة الفجر في وقتها 🕌', nameEn: 'Fajr on time', iconIndex: 3),
+      PackHabit(nameAr: 'ورقة قرآن 🕋', nameEn: 'One page of Quran',
+        iconIndex: 1, target: 1, unit: 'صفحة'),
+      PackHabit(nameAr: 'أذكار الصبح 🌅', nameEn: 'Morning dhikr', iconIndex: 3),
+      PackHabit(nameAr: 'إقلاع عن السهر 📵', nameEn: 'Quit late-night scrolling',
+        iconIndex: 6, isQuit: true),
+    ],
+  ),
+];
+
 // ---------- Daily challenge ----------
 
 class ChallengeSystem {
@@ -2008,7 +3101,7 @@ class ChallengeSystem {
       case 1:
         return measurable.isNotEmpty
             ? (id: 'measurable', title: t('حقّق هدفك 🎯', 'Hit your goal 🎯'),
-                desc: t('صل لهدفك في "${measurable.first.name}" اليوم.',
+                desc: t('صل لهدفك في "${iso(measurable.first.name)}" اليوم.',
                     'Hit your "${measurable.first.name}" goal today.'),
                 target: 1, xp: 60)
             : (id: 'kill_it', title: t('أنهِ كل شيء اليوم ⚡', 'Finish everything today ⚡'),
@@ -2022,7 +3115,7 @@ class ChallengeSystem {
             target: 2, xp: 50);
       case 3:
         return (id: 'noon', title: t('قبل الظهر ☀️', 'Before noon ☀️'),
-            desc: t('أنجز عادة قبل الساعة ١٢:٠٠.',
+            desc: t('أنجز عادة قبل الساعة 12:00.',
                 'Complete a habit before 12:00.'),
             target: 1, xp: 45);
       case 4:
@@ -2032,7 +3125,7 @@ class ChallengeSystem {
             target: 1, xp: 40);
       case 5:
         return (id: 'earlybird', title: t('طائر مبكر 🐦', 'Early bird 🐦'),
-            desc: t('أنجز عادة قبل الساعة ١٠:٠٠.',
+            desc: t('أنجز عادة قبل الساعة 10:00.',
                 'Complete a habit before 10:00.'),
             target: 1, xp: 45);
       default:
@@ -2142,7 +3235,7 @@ class RatingService {
     );
     if (result == 'rate') {
       const uri =
-          'https://play.google.com/store/apps/details?id=com.zeyad.habit_tracker';
+          'https://play.google.com/store/apps/details?id=com.novu.HabitFlow';
       try {
         await launchUrl(Uri.parse(uri),
             mode: LaunchMode.externalApplication);
@@ -2176,9 +3269,10 @@ class _HomePageState extends State<HomePage> {
   void initState() {
     super.initState();
     HomePage.reload = _loadHabits;
-    _loadHabits();
+    // Extras (daily challenge, insights) depend on the habit list, so build
+    // them only after the habits are loaded.
+    _loadHabits().then((_) => _loadExtras());
     _refreshXp();
-    _loadExtras();
     NotificationService.init();
   }
 
@@ -2224,6 +3318,7 @@ class _HomePageState extends State<HomePage> {
         'habits', jsonEncode(habits.map((h) => h.toMap()).toList()));
     refreshWidget();
     widget.onStatsChanged?.call(habits);
+    _loadExtras();
   }
 
   void _deleteHabit(int index) {
@@ -2240,7 +3335,7 @@ class _HomePageState extends State<HomePage> {
           backgroundColor: cardColor(Theme.of(context).brightness),
           title: Text(t('وصلت لحد الإصدار المجاني 🚧', 'You hit the free limit 🚧')),
           content: Text(t(
-              'النسخة المجانية تسمح حتى ٣ عادات.\n\nرقّي إلى برو لعادات غير محدودة وبلا إعلانات والمزيد.',
+              'النسخة المجانية تسمح حتى 3 عادات.\n\nرقّي إلى برو لعادات غير محدودة وبلا إعلانات والمزيد.',
               'The free version allows up to 3 habits.\n\nUpgrade to Pro for unlimited habits, no ads and more.')),
           actions: [
             TextButton(
@@ -2272,6 +3367,10 @@ class _HomePageState extends State<HomePage> {
       await _recordAmount(habit);
       return;
     }
+    if (habit.isTimerHabit) {
+      await _startTimer(habit);
+      return;
+    }
     final completing = !habit.isDoneOn(now);
     setState(() {
       if (completing) {
@@ -2283,28 +3382,72 @@ class _HomePageState extends State<HomePage> {
       }
     });
     _saveHabits();
-    if (completing) await _award(habit);
-    if (completing) _cheer();
+    if (completing) await _afterComplete(habit, now);
+  }
+
+  Future<void> _afterComplete(Habit habit, DateTime now) async {
+    final comeback = habit.isComebackOn(now);
+    await _award(habit);
     final dueNow = habits.where((h) => h.isDueOn(now));
-    if (completing &&
-        dueNow.isNotEmpty &&
-        dueNow.every((h) => h.isDoneOn(now))) {
+    final perfectDay =
+        dueNow.isNotEmpty && dueNow.every((h) => h.isDoneOn(now));
+    if (comeback) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text(t('🎉 يوم مثالي! أنهيت كل عاداتك!',
-                '🎉 Perfect day! You completed all your habits!')),
+            content: Text(t(
+                '💛 عودة! رجعت لـ"${iso(habit.name)}" — ودي تُحسب كإنجاز.',
+                '💛 Comeback! You came back to "${habit.name}" — counted as a win.')),
             behavior: SnackBarBehavior.floating,
-            duration: const Duration(milliseconds: 2200),
+            duration: const Duration(milliseconds: 1800),
           ),
         );
       }
+    } else {
+      _cheer();
     }
-    if (completing) await _checkMilestones();
+    if (perfectDay && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(t('🎉 يوم مثالي! أنهيت كل عاداتك!',
+              '🎉 Perfect day! You completed all your habits!')),
+          behavior: SnackBarBehavior.floating,
+          duration: const Duration(milliseconds: 2200),
+        ),
+      );
+    }
+    await _checkMilestones();
     if (mounted) {
       await RatingService.maybePrompt(context,
           count: _totalCompletions, habits: habits.length);
     }
+  }
+
+  Future<void> _startTimer(Habit habit) async {
+    final now = DateTime.now();
+    if (habit.isDoneOn(now)) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(t('أنجزت "${iso(habit.name)}" اليوم بالفعل ✅',
+                'Already completed "${habit.name}" today ✅')),
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+      }
+      return;
+    }
+    final finished = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => HabitTimerDialog(habit: habit),
+    );
+    if (finished != true || !mounted) return;
+    setState(() {
+      habit.completedDates.add(dayKey(now));
+      habit.setDoneAt(now);
+    });
+    _saveHabits();
+    await _afterComplete(habit, now);
   }
 
   Future<void> _recordAmount(Habit habit) async {
@@ -2324,12 +3467,12 @@ class _HomePageState extends State<HomePage> {
       context: context,
       builder: (ctx) => AlertDialog(
         backgroundColor: cardColor(Theme.of(context).brightness),
-        title: Text(t('سجّل "${habit.name}"', 'Log "${habit.name}"')),
+        title: Text(t('سجّل "${iso(habit.name)}"', 'Log "${habit.name}"')),
         content: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
             Text(t(
-                'اليوم: ${_fmt(recorded)} / ${_fmt(habit.target)}${habit.unit.isEmpty ? '' : ' ${habit.unit}'}',
+                'اليوم: ${ltr('${_fmt(recorded)} / ${_fmt(habit.target)}')}${habit.unit.isEmpty ? '' : ' ${habit.unit}'}',
                 'Today: ${_fmt(recorded)} / ${_fmt(habit.target)}${habit.unit.isEmpty ? '' : ' ${habit.unit}'}')),
             const SizedBox(height: 12),
             TextField(
@@ -2354,7 +3497,7 @@ class _HomePageState extends State<HomePage> {
               children: [
                 for (final q in [1.0, 2.0, 5.0, 10.0])
                   ActionChip(
-                    label: Text('+${_fmt(q)}'),
+                    label: Text(ltr('+${_fmt(q)}')),
                     onPressed: () => Navigator.pop(ctx, q),
                   ),
               ],
@@ -2436,8 +3579,8 @@ class _HomePageState extends State<HomePage> {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(bonus > 0
-              ? t('🔥 سلسلة $streak يوم! +${10 + bonus} XP',
-                  '🔥 $streak-${streak == 1 ? 'day' : 'day'} streak! +${10 + bonus} XP')
+              ? t('🔥 سلسلة ${daysAr(streak)}! ${ltr('+${10 + bonus} XP')}',
+                  '🔥 $streak-day streak! +${10 + bonus} XP')
               : '+10 XP ⚡'),
           duration: const Duration(milliseconds: 1500),
           behavior: SnackBarBehavior.floating,
@@ -2454,7 +3597,7 @@ class _HomePageState extends State<HomePage> {
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text(earned
-            ? t('أجواء رائعة اليوم +5 XP ✨', 'Great mood today +5 XP ✨')
+            ? t('أجواء رائعة اليوم ${ltr('+5 XP')} ✨', 'Great mood today +5 XP ✨')
             : t('شكراً لتفاعلك معنا 💛', 'Thanks for sharing 💛')),
         behavior: SnackBarBehavior.floating,
         duration: const Duration(milliseconds: 1200),
@@ -2484,12 +3627,13 @@ class _HomePageState extends State<HomePage> {
     final challenge = ChallengeSystem.today(habits);
     final res = await ChallengeSystem.maybeComplete(
         habits, challenge.id, challenge.target, challenge.xp);
+    if (res.done) await _loadExtras();
     if (!mounted) return;
     if (newly.isNotEmpty) _showBadgeUnlocked(newly);
     if (res.done && res.xp > 0) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text(t('🎯 اكتمل التحدي اليومي! +${res.xp} XP',
+          content: Text(t('🎯 اكتمل التحدي اليومي! ${ltr('+${res.xp} XP')}',
             '🎯 Daily challenge completed! +${res.xp} XP')),
           behavior: SnackBarBehavior.floating,
           duration: const Duration(milliseconds: 1800),
@@ -2525,7 +3669,7 @@ class _HomePageState extends State<HomePage> {
                 const SizedBox(height: 16),
                 FilledButton(
                   onPressed: () => Navigator.pop(ctx),
-                  child: Text(t('رائع +25 XP', 'Awesome +25 XP')),
+                  child: Text(t('رائع ${ltr('+25 XP')}', 'Awesome +25 XP')),
                 ),
               ],
             ),
@@ -2567,7 +3711,7 @@ class _HomePageState extends State<HomePage> {
                         borderRadius: BorderRadius.circular(4),
                       ),
                       const SizedBox(height: 6),
-                      Text(t('$xpIn / $need XP حتى المستوى التالي',
+                      Text(t('${ltr('$xpIn / $need XP')} حتى المستوى التالي',
                           '$xpIn / $need XP to the next level'),
                           style: TextStyle(
                               color: Colors.grey.shade500, fontSize: 12)),
@@ -2655,7 +3799,9 @@ child: Text(t('رائع!', 'Awesome!')),
     return Scaffold(
       body: SafeArea(
         child: ListView(
-          padding: const EdgeInsets.all(20),
+          // Extra bottom space so the floating + button never covers the
+          // last habit card.
+          padding: const EdgeInsets.fromLTRB(20, 20, 20, 104),
           children: [
             Row(
               children: [
@@ -2666,31 +3812,38 @@ child: Text(t('رائع!', 'Awesome!')),
                   height: 42,
                 ),
                 const SizedBox(width: 12),
-                Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text('$greeting, ${AuthService.name ?? t('صديقي', 'friend')} 👋',
-                        style: TextStyle(
-                            color: Colors.grey.shade500, fontSize: 14)),
-                    ShaderMask(
-                      shaderCallback: (rect) => LinearGradient(
-                        colors: [
-                          Theme.of(context).colorScheme.primary,
-                          Theme.of(context).colorScheme.tertiary,
-                        ],
-                        begin: Alignment.topLeft,
-                        end: Alignment.bottomRight,
-                      ).createShader(rect),
-                      blendMode: BlendMode.srcIn,
-                      child: Text(t('عاداتك', 'Your habits'),
-                          style: const TextStyle(
-                              fontSize: 28,
-                              fontWeight: FontWeight.w800,
-                              color: Colors.white)),
-                    ),
-                  ],
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                          '$greeting${t('،', ',')} ${iso(AuthService.name ?? t('صديقي', 'friend'))} 👋',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                              color: Colors.grey.shade500, fontSize: 14)),
+                      ShaderMask(
+                        shaderCallback: (rect) => LinearGradient(
+                          colors: [
+                            Theme.of(context).colorScheme.primary,
+                            Theme.of(context).colorScheme.tertiary,
+                          ],
+                          begin: Alignment.topLeft,
+                          end: Alignment.bottomRight,
+                        ).createShader(rect),
+                        blendMode: BlendMode.srcIn,
+                        child: Text(t('عاداتك', 'Your habits'),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                                fontSize: 28,
+                                fontWeight: FontWeight.w800,
+                                color: Colors.white)),
+                      ),
+                    ],
+                  ),
                 ),
-                const Spacer(),
+                const SizedBox(width: 8),
                 Row(
                   children: [
                     IconButton(
@@ -2836,7 +3989,7 @@ child: Text(t('رائع!', 'Awesome!')),
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Text(t('المستوى $_level — إجمالي $_xp XP',
+                          Text(t('المستوى $_level — إجمالي ${ltr('$_xp XP')}',
         'Level $_level — $_xp total XP'),
     style: const TextStyle(
         fontWeight: FontWeight.bold, fontSize: 14)),
@@ -2854,7 +4007,7 @@ child: Text(t('رائع!', 'Awesome!')),
                           ),
                           const SizedBox(height: 4),
                           Text(
-                            t('${XpSystem.xpInLevel(_xp)} / ${XpSystem.xpToNextLevel(_xp)} XP حتى المستوى التالي',
+                            t('${ltr('${XpSystem.xpInLevel(_xp)} / ${XpSystem.xpToNextLevel(_xp)} XP')} حتى المستوى التالي',
                                 '${XpSystem.xpInLevel(_xp)} / ${XpSystem.xpToNextLevel(_xp)} XP to next level'),
                             style: TextStyle(
                                 color: Colors.grey.shade500, fontSize: 11),
@@ -2918,10 +4071,13 @@ if (_challengeClaimed)
                                 child: ClipRRect(
                                   borderRadius: BorderRadius.circular(4),
                                   child: LinearProgressIndicator(
-                                    value: _challenge!.target == 0
-                                        ? 0
-                                        : (_challengeProg / _challenge!.target)
-                                            .clamp(0.0, 1.0),
+                                    value: _challengeClaimed
+                                        ? 1
+                                        : _challenge!.target == 0
+                                            ? 0
+                                            : (_challengeProg /
+                                                    _challenge!.target)
+                                                .clamp(0.0, 1.0),
                                     minHeight: 8,
                                     backgroundColor: secondaryColor(brightness),
                                     color: primary,
@@ -2929,7 +4085,12 @@ if (_challengeClaimed)
                                 ),
                               ),
                               const SizedBox(width: 10),
-                              Text('$_challengeProg/${_challenge!.target}',
+                              // Once claimed the challenge stays complete,
+                              // even if a habit is unchecked later today.
+                              Text(
+                                  _challengeClaimed
+                                      ? '${max(_challenge!.target, 1)}/${max(_challenge!.target, 1)}'
+                                      : '$_challengeProg/${_challenge!.target}',
                                   style: TextStyle(
                                       fontSize: 12,
                                       color: Colors.grey.shade500)),
@@ -2957,7 +4118,7 @@ if (_challengeClaimed)
         fontSize: 14, fontWeight: FontWeight.bold)),
 const Spacer(),
 if (_moodStreak >= 2)
-  Text(t('🔥 $_moodStreak أيام', '🔥 $_moodStreak days'),
+  Text('🔥 ${daysLabel(_moodStreak)}',
       style: TextStyle(
           fontSize: 12, color: Colors.deepOrange)),
                       ],
@@ -3020,7 +4181,9 @@ Text(t('محلي · خاص', 'Local · private'),
                           child: Text(s,
                               style: TextStyle(
                                   fontSize: 13,
-                                  color: Colors.grey.shade300)),
+                                  color: Theme.of(context)
+                                      .colorScheme
+                                      .onSurfaceVariant)),
                         ),
                     ],
                   ),
@@ -3092,12 +4255,14 @@ Text(t('محلي · خاص', 'Local · private'),
                 final done = habit.isDoneOn(clock());
                 final streak = habit.currentStreak();
                 final amount = habit.amountOn(clock());
+                final onDone = Theme.of(context).colorScheme.onPrimary;
+                final onDoneSoft = onDone.withAlpha(200);
                 return Dismissible(
                   key: ValueKey(habit.id),
                   direction: DismissDirection.endToStart,
                   background: Container(
-                    alignment: Alignment.centerRight,
-                    padding: const EdgeInsets.only(right: 20),
+                    alignment: AlignmentDirectional.centerEnd,
+                    padding: const EdgeInsetsDirectional.only(end: 20),
                     margin: const EdgeInsets.only(bottom: 12),
                     decoration: BoxDecoration(
                       color: Colors.red.withAlpha(77),
@@ -3143,17 +4308,14 @@ Text(t('محلي · خاص', 'Local · private'),
                         ),
                       ],
                     ),
-                    child: ListTile(
-                      contentPadding: const EdgeInsets.symmetric(
-                          horizontal: 16, vertical: 8),
+child: Material(
+            color: Colors.transparent,
+            borderRadius: BorderRadius.circular(20),
+            clipBehavior: Clip.antiAlias,
+            child: ListTile(
+              contentPadding: const EdgeInsets.symmetric(
+                  horizontal: 16, vertical: 8),
                       onTap: () {
-                        if (!AuthService.isProUser) {
-                          showProUpgrade(context,
-                              message: t(
-                                  'تفاصيل العادة والسلاسل والتاريخ من مميزات برو.',
-                                  'Habit details, streaks and history are a Pro feature.'));
-                          return;
-                        }
                         Navigator.push(
                           context,
                           MaterialPageRoute(
@@ -3192,7 +4354,7 @@ Text(t('محلي · خاص', 'Local · private'),
                                 ],
                         ),
                         child: Icon(habit.icon,
-                            color: Colors.white, size: 26),
+                            color: done ? onDone : Colors.white, size: 26),
                       ),
                       title: Text(
                         habit.name,
@@ -3201,7 +4363,7 @@ Text(t('محلي · خاص', 'Local · private'),
                           fontWeight: FontWeight.w600,
                           decoration:
                               done ? TextDecoration.lineThrough : null,
-                          color: done ? Colors.white : null,
+                          color: done ? onDone : null,
                         ),
                       ),
                       subtitle: Column(
@@ -3222,20 +4384,20 @@ Text(t('محلي · خاص', 'Local · private'),
                                             : 0,
                                         minHeight: 8,
                                         backgroundColor: done
-                                            ? Colors.white.withAlpha(50)
+                                            ? onDone.withAlpha(50)
                                             : secondaryColor(brightness),
                                         color: done
-                                            ? Colors.white
+                                            ? onDone
                                             : primary,
                                       ),
                                     ),
                                   ),
                                   const SizedBox(width: 10),
                                   Text(
-                                    '${_fmt(amount)}/${_fmt(habit.target)}${habit.unit.isEmpty ? '' : ' ${habit.unit}'}',
+                                    '${ltr('${_fmt(amount)}/${_fmt(habit.target)}')}${habit.unit.isEmpty ? '' : ' ${habit.unit}'}',
                                     style: TextStyle(
                                         color: done
-                                            ? Colors.white
+                                            ? onDone
                                             : primary,
                                         fontSize: 11,
                                         fontWeight: FontWeight.bold),
@@ -3251,18 +4413,15 @@ Text(t('محلي · خاص', 'Local · private'),
                                   if (AuthService.isProUser &&
                                       streak > 0) ...[
                                     if (done) ...[
-                                      const Icon(
+                                      Icon(
                                           Icons.local_fire_department,
-                                          color: Colors.white60,
+                                          color: onDoneSoft,
                                           size: 14),
                                       const SizedBox(width: 3),
                                       Text(
-                                          t('$streak يوم',
-                                              streak == 1
-                                                  ? '$streak day'
-                                                  : '$streak days'),
-                                          style: const TextStyle(
-                                              color: Colors.white60,
+                                          daysLabel(streak),
+                                          style: TextStyle(
+                                              color: onDoneSoft,
                                               fontSize: 11)),
                                       const SizedBox(width: 8),
                                     ] else ...[
@@ -3291,11 +4450,7 @@ Text(t('محلي · خاص', 'Local · private'),
                                                   size: 14),
                                               const SizedBox(width: 4),
                                               Text(
-                                                  t(
-                                                      '$streak يوم',
-                                                      streak == 1
-                                                          ? '$streak day'
-                                                          : '$streak days'),
+                                                  daysLabel(streak),
                                                   style: const TextStyle(
                                                       color:
                                                           Colors.white,
@@ -3308,12 +4463,58 @@ Text(t('محلي · خاص', 'Local · private'),
                                       const SizedBox(width: 8),
                                     ],
                                   ],
+                                  if (AuthService.isProUser &&
+                                      !done &&
+                                      streak == 0 &&
+                                      habit.longestStreak() > 0) ...[
+                                    Container(
+                                      padding: const EdgeInsets.symmetric(
+                                          horizontal: 9, vertical: 3),
+                                      decoration: BoxDecoration(
+                                        color: const Color(0xFFFFB74D)
+                                            .withAlpha(40),
+                                        borderRadius:
+                                            BorderRadius.circular(10),
+                                        border: Border.all(
+                                            color: const Color(0xFFFFB74D)
+                                                .withAlpha(170)),
+                                      ),
+                                      child: Row(
+                                          mainAxisSize: MainAxisSize.min,
+                                          children: [
+                                            const Icon(Icons.wb_twilight,
+                                                size: 13,
+                                                color: Color(0xFFFFB74D)),
+                                            const SizedBox(width: 4),
+                                            Text(
+                                                t(
+                                                    'أفضل سلسلة ${habit.longestStreak()} · أعد الإشعال',
+                                                    'Best run ${habit.longestStreak()} · relight today'),
+                                                style: const TextStyle(
+                                                    color: Color(0xFFFFB74D),
+                                                    fontSize: 11,
+                                                    fontWeight:
+                                                        FontWeight.bold)),
+                                          ]),
+                                    ),
+                                    const SizedBox(width: 8),
+                                  ],
+                                  if (habit.isTimerHabit) ...[
+                                    Text(
+                                        '⏱ ${habit.timerMinutes} ${t('دقيقة', 'min')}',
+                                        style: TextStyle(
+                                            color: done
+                                                ? onDoneSoft
+                                                : Colors.grey.shade500,
+                                            fontSize: 11)),
+                                    const SizedBox(width: 8),
+                                  ],
                                   if (habit.isWeekly &&
                                       habit.weekdays.length < 7)
                                     Text(_weekdayShort(habit.weekdays),
                                         style: TextStyle(
                                             color: done
-                                                ? Colors.white60
+                                                ? onDoneSoft
                                                 : Colors.grey.shade500,
                                             fontSize: 11)),
                                   if (habit.isFlexible)
@@ -3323,7 +4524,7 @@ Text(t('محلي · خاص', 'Local · private'),
                                             '${habit.timesPerWeek}x/week'),
                                         style: TextStyle(
                                             color: done
-                                                ? Colors.white60
+                                                ? onDoneSoft
                                                 : Colors.grey.shade500,
                                             fontSize: 11)),
                                   if (habit.isQuit &&
@@ -3331,14 +4532,12 @@ Text(t('محلي · خاص', 'Local · private'),
                                     Text(
                                         (AuthService.isProUser &&
                                                 streak > 0)
-                                            ? t(
-                                                '🍃 أنظف · $streak يوم',
-                                                '🍃 Clean · $streak ${streak == 1 ? 'day' : 'days'}')
+                                            ? '🍃 ${t('أنظف', 'Clean')} · ${daysLabel(streak)}'
                                             : t('حافظ على نظافتها',
                                                 'Keep it clean'),
                                         style: TextStyle(
                                             color: done
-                                                ? Colors.white60
+                                                ? onDoneSoft
                                                 : Colors.grey.shade500,
                                             fontSize: 11)),
                                   if (habit.reminderEnabled) ...[
@@ -3348,7 +4547,7 @@ Text(t('محلي · خاص', 'Local · private'),
                                             .notifications_active_outlined,
                                         size: 14,
                                         color: done
-                                            ? Colors.white60
+                                            ? onDoneSoft
                                             : Colors.grey.shade500),
                                   ],
                                 ],
@@ -3357,7 +4556,9 @@ Text(t('محلي · خاص', 'Local · private'),
                         ],
                       ),
                       trailing: GestureDetector(
-                        onTap: () => _toggleToday(habit),
+                        onTap: () => habit.isTimerHabit
+                            ? _startTimer(habit)
+                            : _toggleToday(habit),
                         child: habit.isMeasurable
                             ? AnimatedContainer(
                                 duration:
@@ -3394,14 +4595,19 @@ Text(t('محلي · خاص', 'Local · private'),
                                           ? Icon(Icons.check_circle,
                                               color: primary,
                                               size: 26)
-                                          : Row(children: [
-                                              Icon(Icons.add,
-                                                  size: 16,
-                                                  color:
-                                                      Colors.white),
-                                              const SizedBox(
-                                                  width: 4),
-                                              Text(t('إضافة', 'Add'),
+                                          : habit.isTimerHabit
+                                              ? Icon(
+                                                  Icons.play_circle_fill,
+                                                  color: primary,
+                                                  size: 28)
+                                              : Row(children: [
+                                                  Icon(Icons.add,
+                                                      size: 16,
+                                                      color:
+                                                          Colors.white),
+                                                  const SizedBox(
+                                                      width: 4),
+                                                  Text(t('إضافة', 'Add'),
                                                   style: const TextStyle(
                                                       color: Colors
                                                           .white,
@@ -3457,42 +4663,47 @@ Text(t('محلي · خاص', 'Local · private'),
                       ),
                     ),
                   ),
-                );
-              }),
+),
+            );
+          }),
             const SizedBox(height: 20),
           ],
         ),
       ),
-      floatingActionButton: Material(
-        color: Colors.transparent,
-        child: Ink(
-          width: 64,
-          height: 64,
-          decoration: BoxDecoration(
-            shape: BoxShape.circle,
-            gradient: LinearGradient(
-              colors: [
-                Theme.of(context).colorScheme.primary,
-                Theme.of(context).colorScheme.tertiary,
-              ],
-              begin: Alignment.topLeft,
-              end: Alignment.bottomRight,
-            ),
-            boxShadow: [
-              BoxShadow(
-                color: Theme.of(context)
-                    .colorScheme
-                    .primary
-                    .withValues(alpha: 0.32),
-                blurRadius: 20,
-                offset: const Offset(0, 6),
-              ),
+      // The gradient and shadow live on a plain circular Container; a
+      // rectangular Material around an Ink clipped the shadow into a square.
+      floatingActionButton: Container(
+        width: 64,
+        height: 64,
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          gradient: LinearGradient(
+            colors: [
+              Theme.of(context).colorScheme.primary,
+              Theme.of(context).colorScheme.tertiary,
             ],
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
           ),
+          boxShadow: [
+            BoxShadow(
+              color: Theme.of(context)
+                  .colorScheme
+                  .primary
+                  .withValues(alpha: 0.32),
+              blurRadius: 20,
+              offset: const Offset(0, 6),
+            ),
+          ],
+        ),
+        child: Material(
+          type: MaterialType.transparency,
+          shape: const CircleBorder(),
+          clipBehavior: Clip.antiAlias,
           child: InkWell(
-            customBorder: const CircleBorder(),
             onTap: _showAddDialog,
-            child: const Icon(Icons.add, color: Colors.white, size: 30),
+            child: Icon(Icons.add,
+                color: Theme.of(context).colorScheme.onPrimary, size: 30),
           ),
         ),
       ),
@@ -3520,15 +4731,6 @@ class _MainShellState extends State<MainShell> {
   }
 
   void _goToTab(int index) {
-    if (index == 1 && !AuthService.isProUser) {
-      showProUpgrade(
-        context,
-        message: t(
-            'الإحصائيات الأسبوعية والإنجازات وخريطة عاداتك من مميزات برو.',
-            'Weekly stats, achievements and your habit map are Pro features.'),
-      );
-      return;
-    }
     if (index == 1) setState(() => _refreshTick++);
     setState(() => _index = index);
   }
@@ -3564,17 +4766,23 @@ class AdBannerWidget extends StatefulWidget {
 
 class _AdBannerWidgetState extends State<AdBannerWidget> {
   BannerAd? _banner;
+  bool _loaded = false;
 
   @override
   void initState() {
     super.initState();
     _banner = BannerAd(
-      adUnitId: 'ca-app-pub-3940256099942544/6300978111',
+      adUnitId: 'ca-app-pub-7463001555516394/3182260121',
       size: AdSize.banner,
       request: const AdRequest(),
       listener: BannerAdListener(
-        onAdLoaded: (_) => setState(() {}),
-        onAdFailedToLoad: (ad, error) => ad.dispose(),
+        onAdLoaded: (_) {
+          if (mounted) setState(() => _loaded = true);
+        },
+        onAdFailedToLoad: (ad, error) {
+          ad.dispose();
+          if (mounted) setState(() => _banner = null);
+        },
       ),
     )..load();
   }
@@ -3587,7 +4795,8 @@ class _AdBannerWidgetState extends State<AdBannerWidget> {
 
   @override
   Widget build(BuildContext context) {
-    if (_banner == null) return const SizedBox.shrink();
+    // Reserve no space until an ad has actually loaded.
+    if (_banner == null || !_loaded) return const SizedBox.shrink();
     return Container(
       color: Theme.of(context).brightness == Brightness.dark
           ? const Color(0xFF1C2127)
@@ -3695,7 +4904,12 @@ class _NavItem extends StatelessWidget {
         onTap: onTap,
         child: AnimatedContainer(
           duration: const Duration(milliseconds: 300),
-          curve: Curves.easeOutBack,
+          // Must not overshoot: decoration tweens are only valid for t in
+          // [0, 1]. easeOutBack pushed t past 1 while a tab was being
+          // deselected, scaling the shadow blur negative and throwing
+          // ("Text shadow blur radius should be non-negative"), which
+          // flashed a red error widget in the nav bar on every tab switch.
+          curve: Curves.easeOutCubic,
           height: 58,
           alignment: Alignment.center,
           padding: const EdgeInsets.symmetric(horizontal: 14),
@@ -3732,7 +4946,7 @@ class _NavItem extends StatelessWidget {
                 curve: Curves.easeOutCubic,
                 child: active
                     ? Padding(
-                        padding: const EdgeInsets.only(left: 8),
+                        padding: const EdgeInsetsDirectional.only(start: 8),
                         child: Text(
                           label,
                           style: const TextStyle(
@@ -3751,24 +4965,164 @@ class _NavItem extends StatelessWidget {
   }
 }
 
-class ProPage extends StatelessWidget {
+class ProPage extends StatefulWidget {
   const ProPage({super.key});
+
+  @override
+  State<ProPage> createState() => _ProPageState();
+}
+
+class _ProPageState extends State<ProPage> {
+  ProductDetails? _pro;
+  bool _loading = true;
+  bool _busy = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    await BillingService.instance.ensureProduct();
+    if (mounted) {
+      setState(() {
+        _pro = BillingService.instance.proProduct;
+        _loading = false;
+      });
+    }
+  }
+
+  Future<void> _buy() async {
+    if (_busy) { return; }
+    setState(() => _busy = true);
+    final outcome = await BillingService.instance.buyPro();
+    if (!mounted) { return; }
+    setState(() => _busy = false);
+    switch (outcome) {
+      case BillingOutcome.granted:
+        _welcomeDialog();
+        break;
+      case BillingOutcome.pending:
+        _snack(t('الدفع قيد المراجعة…', 'Payment pending review…'));
+        break;
+      case BillingOutcome.canceled:
+        _snack(t('تم إلغاء الدفع.', 'Purchase canceled.'));
+        break;
+      case BillingOutcome.unavailable:
+        _snack(t('الدفع غير متاح على هذا الجهاز الآن.',
+            'Billing is not available on this device right now.'));
+        break;
+      case BillingOutcome.noProduct:
+        _snack(t('لم يتم إعداد المنتج في المتجر بعد.',
+            'The store product is not configured yet.'));
+        break;
+      default:
+        _snack(t('حدث خطأ في عملية الدفع، حاول مجدداً.',
+            'Something went wrong. Please try again.'));
+    }
+  }
+
+  void _snack(String msg) {
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  Future<void> _restore() async {
+    if (_busy) { return; }
+    setState(() => _busy = true);
+    final outcome = await BillingService.instance.restore();
+    if (!mounted) { return; }
+    setState(() => _busy = false);
+    if (outcome == BillingOutcome.granted) {
+      _welcomeDialog();
+    } else {
+      _snack(t('لا يوجد اشتراك فعّال قابل للاستعادة.',
+          'No active subscription to restore.'));
+    }
+  }
+
+  Future<void> _downgrade() async {
+    if (_busy) { return; }
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: cardColor(Theme.of(ctx).brightness),
+        title: Text(t('الرجوع للنسخة المجانية؟', 'Back to the free version?')),
+        content: Text(t(
+            'ستفقد ميزات برو وستعود الإعلانات في التطبيق. إن كان الاشتراك مفعّلاً عبر Google Play، ألغِ تفعيله من تطبيق Play أولاً حتى لا يتجدّد.',
+            'You will lose Pro features and ads will come back. If your subscription is active through Google Play, cancel it in the Play app first so it does not renew.')),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: Text(t('إلغاء', 'Cancel')),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: Colors.red),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: Text(t('تأكيد الرجوع', 'Confirm')),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) { return; }
+    setState(() => _busy = true);
+    await AuthService.setPro(false);
+    if (!mounted) { return; }
+    HabitFlowApp.of(context)?.refreshPro();
+    _snack(t('رجعت للنسخة المجانية ✅', 'You are back to the free version ✅'));
+    Navigator.pop(context);
+  }
+
+  Future<void> _welcomeDialog() async {
+    await showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: cardColor(Theme.of(ctx).brightness),
+        title: const Text('HabitFlow Pro'),
+        content: Text(t(
+            'أهلاً بك في برو! جميع ميزات برو مفعّلة الآن، والاشتراك الشهري يجدّد تلقائياً عبر Google Play.',
+            'Welcome to Pro! All Pro features are enabled. Your monthly subscription renews automatically through Google Play.')),
+        actions: [
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('OK'),
+          ),
+        ],
+      ),
+    );
+    if (mounted) { Navigator.pop(context); }
+  }
 
   @override
   Widget build(BuildContext context) {
     final primary = Theme.of(context).colorScheme.primary;
     final brightness = Theme.of(context).brightness;
 
+    // Keep this list in sync with the AuthService.isProUser checks.
     final features = [
       (Icons.block, t('بلا إعلانات', 'No ads'),
-          t('إزالة كل الإعلانات نهائياً', 'Remove all ads for good')),
+          t('إزالة إعلان الشاشة الرئيسية', 'Remove the banner ad on the home screen')),
       (Icons.all_inclusive, t('عادات غير محدودة', 'Unlimited habits'),
-          t('أضف عدداً غير محدود من العادات', 'Add an unlimited number of habits')),
+          t('المجاني حتى 3 عادات — برو بلا حد', 'Free allows 3 habits — Pro has no limit')),
+      (Icons.straighten, t('عادات قابلة للقياس ومؤقت', 'Measurable & timer habits'),
+          t('أهداف بوحدات (صفحات، دقائق…) وعدّاد تنازلي',
+              'Goals with units (pages, minutes…) and a countdown timer')),
+      (Icons.notifications_active, t('تذكير لكل عادة', 'Per-habit reminders'),
+          t('تذكير يومي بوقت خاص لكل عادة', 'A daily reminder at its own time for each habit')),
+      (Icons.emoji_events, t('مستويات وشارات وتحديات', 'Levels, badges & challenges'),
+          t('نقاط XP، تحدي يومي، تسجيل المزاج ورؤى ذكية',
+              'XP, a daily challenge, mood check-ins and smart insights')),
+      (Icons.insights, t('تحليلات متقدمة', 'Advanced analytics'),
+          t('ملخص الأسبوع، الرسوم البيانية، خرائط النشاط والإنجازات',
+              'Weekly recap, charts, activity heatmaps and achievements')),
+      (Icons.palette, t('تخصيص كامل', 'Full customisation'),
+          t('مكتبة الأيقونات الكاملة ولون مخصص للتطبيق',
+              'The full icon library and a custom app colour')),
       (Icons.cloud_done, t('نسخ احتياطي واستعادة', 'Backup & restore'),
-          t('احفظ واستعد بياناتك في أي وقت', 'Save and restore your data anytime')),
-      (Icons.new_releases, t('مميزات جديدة أولاً', 'New features first'),
-          t('احصل على كل ميزة جديدة قبل أي شخص آخر',
-              'Get every new feature before anyone else')),
+          t('صدّر بياناتك لملف واستعدها في أي وقت',
+              'Export your data to a file and restore it anytime')),
     ];
 
     return Scaffold(
@@ -3782,8 +5136,15 @@ class ProPage extends StatelessWidget {
           Container(
             padding: const EdgeInsets.all(24),
             decoration: BoxDecoration(
+              // The dark-mode primary is a light pastel; darken it so the
+              // white hero text and logo stay readable.
               gradient: LinearGradient(
-                colors: [primary, primary.withAlpha(150)],
+                colors: brightness == Brightness.dark
+                    ? [
+                        Color.lerp(primary, Colors.black, 0.45)!,
+                        Color.lerp(primary, Colors.black, 0.25)!,
+                      ]
+                    : [primary, primary.withAlpha(150)],
                 begin: Alignment.topLeft,
                 end: Alignment.bottomRight,
               ),
@@ -3791,10 +5152,10 @@ class ProPage extends StatelessWidget {
             ),
             child: Column(
               children: [
+                // White text sits on the primary gradient, so the logo is
+                // always the white variant.
                 Image.asset(
-                  brightness == Brightness.dark
-                      ? 'assets/icon/logo_white.png'
-                      : 'assets/icon/logo_black.png',
+                  'assets/icon/logo_white.png',
                   height: 70,
                 ),
                 const SizedBox(height: 12),
@@ -3859,8 +5220,8 @@ class ProPage extends StatelessWidget {
                   crossAxisAlignment: CrossAxisAlignment.baseline,
                   textBaseline: TextBaseline.alphabetic,
                   children: [
-                    const Text('\$2.99',
-                        style: TextStyle(
+                    Text(_pro?.price ?? t('—', '—'),
+                        style: const TextStyle(
                             fontSize: 40, fontWeight: FontWeight.bold)),
                     Text(t(' /شهر', '/month'),
                         style:
@@ -3879,55 +5240,70 @@ class ProPage extends StatelessWidget {
                         style: const TextStyle(
                             fontSize: 15, fontWeight: FontWeight.bold),
                       ),
+                      const SizedBox(height: 14),
+                      OutlinedButton.icon(
+                        onPressed: _busy ? null : _downgrade,
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: Colors.red.shade400,
+                          side: BorderSide(color: Colors.red.shade400),
+                        ),
+                          icon: const Icon(Icons.arrow_back, size: 18),
+                        label: Text(t('الرجوع للنسخة المجانية',
+                            'Back to the free version')),
+                      ),
                     ],
                   )
                 else
                   SizedBox(
                     width: double.infinity,
                     child: FilledButton(
-                      onPressed: () async {
-                        await AuthService.setPro(true);
-                        if (context.mounted) {
-                          showDialog(
-                            context: context,
-                            builder: (ctx) => AlertDialog(
-                              backgroundColor: cardColor(brightness),
-                              title: Text(t('أهلاً بك في برو! 🎉',
-                                  'Welcome to Pro! 🎉')),
-                              content: Text(t(
-                                  'جميع ميزات برو مفعّلة الآن.\n(شراء تجريبي — اربط الفوترة الحقيقية قبل الإطلاق)',
-                                  'All Pro features are now enabled.\n(Trial purchase — wire real billing before launch)')),
-                              actions: [
-                                FilledButton(
-                                  onPressed: () {
-                                    Navigator.pop(ctx);
-                                    Navigator.pop(context);
-                                  },
-                                  child: Text(t('رائع', 'Awesome')),
-                                ),
-                              ],
-                            ),
-                          );
-                        }
-                      },
+                      onPressed: _busy ? null : _buy,
                       style: FilledButton.styleFrom(backgroundColor: primary),
                       child: Padding(
                         padding: const EdgeInsets.all(12),
-                        child: Text(t('رقِّ الآن', 'Upgrade now'),
-                            style: const TextStyle(fontSize: 16)),
+                        child: _busy
+                            ? const SizedBox(
+                                width: 22,
+                                height: 22,
+                                child: CircularProgressIndicator(
+                                    strokeWidth: 2.5, color: Colors.white))
+                            : Text(
+                                _pro != null
+                                    ? t('اشترك الآن', 'Subscribe now')
+                                    : t('التفاصيل عند فتح Play…',
+                                        'Loading store details…'),
+                                style: const TextStyle(fontSize: 16)),
                       ),
                     ),
                   ),
               ],
             ),
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: 14),
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton(
+              onPressed: _busy ? null : _restore,
+              child: Text(t('استعادة الاشتراك', 'Restore purchase')),
+            ),
+          ),
+          const SizedBox(height: 10),
           Text(
-            t('فوترة تجريبية — أضف Google Play Billing للمتجر الفعلي.',
-                'Demo billing — add Google Play Billing for the real store.'),
+            t('اشتراك شهري يجدّد تلقائياً عبر Google Play. يمكنك الإلغاء من متجر Play في أي وقت.',
+                'Monthly subscription, auto-renewed by Google Play. Cancel anytime from the Play Store.'),
             textAlign: TextAlign.center,
             style: TextStyle(color: Colors.grey.shade600, fontSize: 12),
           ),
+          if (_pro == null && !_loading)
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Text(
+                t('إن لم تظهر التفاصيل، تأكد من تهيئة المنتج في Play Console ثم أعد فتح الصفحة.',
+                    'If details do not appear, ensure the product is set up in Play Console, then reopen this page.'),
+                textAlign: TextAlign.center,
+                style: TextStyle(color: Colors.orange.shade700, fontSize: 11),
+              ),
+            ),
         ],
       ),
     );
@@ -3989,13 +5365,15 @@ Future<void> showHabitDialog(
       List.of(existing?.weekdays ?? [1, 2, 3, 4, 5, 6, 7]);
   int timesPerWeek = existing?.timesPerWeek ?? 3;
   bool measurable = (existing?.target ?? 0) > 0;
+  bool timerOn = existing?.isTimer ?? false;
+  int timerMinutes = existing?.timerMinutes ?? 5;
   bool isQuit = existing?.isQuit ?? false;
   bool reminderOn = existing?.reminderEnabled ?? false;
   TimeOfDay reminderTime = TimeOfDay(
     hour: existing?.reminderHour ?? 20,
     minute: existing?.reminderMinute ?? 0,
   );
-  final icons = Habit.availableIcons;
+  final icons = Habit.basicIcons;
   const weekDays = [1, 2, 3, 4, 5, 6, 7];
   String? formError;
 
@@ -4050,7 +5428,11 @@ Future<void> showHabitDialog(
             ),
           ],
         ),
-        content: SingleChildScrollView(
+        // AlertDialog measures intrinsic width; a fixed width keeps it from
+        // querying the horizontal icon GridView (a viewport), which throws.
+        content: SizedBox(
+          width: double.maxFinite,
+          child: SingleChildScrollView(
           child: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -4129,6 +5511,42 @@ Future<void> showHabitDialog(
                   ),
                 ),
               ),
+              const SizedBox(height: 10),
+              Align(
+                alignment: AlignmentDirectional.centerStart,
+                child: OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 14, vertical: 10),
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14)),
+                  ),
+                  onPressed: () async {
+                    if (!AuthService.isProUser) {
+                      showProUpgrade(ctx,
+                          message: t(
+                              'مكتبة الأيقونات الكاملة من مميزات برو.',
+                              'The full icon library is a Pro feature.'));
+                      return;
+                    }
+                    final picked = await showDialog<int>(
+                      context: context,
+                      builder: (_) =>
+                          _IconLibraryDialog(selectedIndex: selectedIndex),
+                    );
+                    if (picked != null) {
+                      setDialogState(() => selectedIndex = picked);
+                    }
+                  },
+                  icon: Icon(
+                    selectedIndex >= Habit.basicIcons.length
+                        ? Habit.availableIcons[selectedIndex]
+                        : Icons.apps_rounded,
+                    size: 20,
+                  ),
+                  label: Text(t('أيقونات أكثر', 'More icons')),
+                ),
+              ),
               const SizedBox(height: 16),
               Text(t('التكرار', 'Frequency'),
                   style: TextStyle(
@@ -4137,10 +5555,29 @@ Future<void> showHabitDialog(
                       fontWeight: FontWeight.bold)),
               const SizedBox(height: 6),
               SegmentedButton<int>(
+                style: SegmentedButton.styleFrom(
+                  textStyle: const TextStyle(
+                      fontSize: 12.5, fontWeight: FontWeight.w600),
+                ),
                 segments: [
-                  ButtonSegment(value: 0, label: Text(t('يومي', 'Daily'))),
-                  ButtonSegment(value: 1, label: Text(t('أسبوعي', 'Weekly'))),
-                  ButtonSegment(value: 2, label: Text(t('عدد مرات', 'Times a week'))),
+                  ButtonSegment(
+                      value: 0,
+                      label: Text(t('يومي', 'Daily'),
+                          maxLines: 1,
+                          softWrap: false,
+                          overflow: TextOverflow.fade)),
+                  ButtonSegment(
+                      value: 1,
+                      label: Text(t('أسبوعي', 'Weekly'),
+                          maxLines: 1,
+                          softWrap: false,
+                          overflow: TextOverflow.fade)),
+                  ButtonSegment(
+                      value: 2,
+                      label: Text(t('مرات/أسبوع', 'Times/wk'),
+                          maxLines: 1,
+                          softWrap: false,
+                          overflow: TextOverflow.fade)),
                 ],
                 selected: {frequency},
                 onSelectionChanged: (s) =>
@@ -4194,7 +5631,13 @@ Future<void> showHabitDialog(
               const SizedBox(height: 14),
               SwitchListTile(
                 contentPadding: EdgeInsets.zero,
-                title: Text(t('قابلة للقياس (هدف ووحدة)', 'Measurable (goal & unit)')),
+                title: Row(children: [
+                  Expanded(
+                      child: Text(t('قابلة للقياس (هدف ووحدة)',
+                          'Measurable (goal & unit)'))),
+                  if (!AuthService.isProUser)
+                    const Icon(Icons.lock, size: 15, color: Colors.grey),
+                ]),
                 subtitle: Text(t('مثال: صفحات، دقائق، أكواب ماء',
                     'Example: pages, minutes, cups of water')),
                 value: measurable,
@@ -4272,6 +5715,56 @@ Future<void> showHabitDialog(
               const SizedBox(height: 10),
               SwitchListTile(
                 contentPadding: EdgeInsets.zero,
+                title: Row(children: [
+                  Expanded(
+                      child: Text(t('عادة مؤقت ⏱️', 'Timer habit ⏱️'))),
+                  if (!AuthService.isProUser)
+                    const Icon(Icons.lock, size: 15, color: Colors.grey),
+                ]),
+                subtitle: Text(t(
+                    'تكتمل لما المؤقت يخلص (تأمل، تركيز، جلسة صلاة…)',
+                    'Completes when the countdown finishes (meditation, focus, prayer…)')),
+                value: timerOn,
+                onChanged: (v) {
+                  if (v && !AuthService.isProUser) {
+                    showProUpgrade(ctx,
+                        message: t(
+                            'عادات المؤقت (عدّاد تنازلي للدقائق) من مميزات برو.',
+                            'Timer habits (a countdown for minutes) are a Pro feature.'));
+                    return;
+                  }
+                  setDialogState(() {
+                    timerOn = v;
+                    if (v) measurable = false;
+                  });
+                },
+              ),
+              if (timerOn) ...[
+                const SizedBox(height: 4),
+                Row(
+                  children: [
+                    Text(t('المدة:', 'Duration:')),
+                    const SizedBox(width: 10),
+                    IconButton(
+                      icon: const Icon(Icons.remove_circle_outline),
+                      onPressed: timerMinutes > 1
+                          ? () => setDialogState(
+                              () => timerMinutes = max(1, timerMinutes - 5))
+                          : null,
+                    ),
+                    Text('$timerMinutes ${t('دقيقة', 'min')}',
+                        style: const TextStyle(fontWeight: FontWeight.bold)),
+                    IconButton(
+                      icon: const Icon(Icons.add_circle_outline),
+                      onPressed:
+                          () => setDialogState(() => timerMinutes += 5),
+                    ),
+                  ],
+                ),
+              ],
+              const SizedBox(height: 10),
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
                 title: Text(t('هل تريد الإقلاع عن عادة سيئة؟',
                     'Quitting a bad habit?')),
                 subtitle: Text(t(
@@ -4283,7 +5776,11 @@ Future<void> showHabitDialog(
               const SizedBox(height: 4),
               SwitchListTile(
                 contentPadding: EdgeInsets.zero,
-                title: Text(t('ذكّرني', 'Remind me')),
+                title: Row(children: [
+                  Expanded(child: Text(t('ذكّرني', 'Remind me'))),
+                  if (!AuthService.isProUser)
+                    const Icon(Icons.lock, size: 15, color: Colors.grey),
+                ]),
                 subtitle: Text(reminderOn
                     ? t('في ${reminderTime.format(context)}',
                         'At ${reminderTime.format(context)}')
@@ -4322,6 +5819,7 @@ Future<void> showHabitDialog(
               ],
             ],
           ),
+        ),
         ),
         actions: [
           TextButton(
@@ -4368,6 +5866,8 @@ Future<void> showHabitDialog(
                 target: measurable ? (target > 0 ? target : 1) : 0,
                 unit: measurable ? unitController.text.trim() : '',
                 isQuit: isQuit,
+                isTimer: timerOn,
+                timerMinutes: timerOn ? timerMinutes : 5,
                 reminderEnabled: reminderOn,
                 reminderHour: reminderOn ? reminderTime.hour : null,
                 reminderMinute: reminderOn ? reminderTime.minute : null,
@@ -4381,6 +5881,156 @@ Future<void> showHabitDialog(
       ),
     ),
   );
+}
+
+class HabitTimerDialog extends StatefulWidget {
+  final Habit habit;
+  const HabitTimerDialog({super.key, required this.habit});
+
+  @override
+  State<HabitTimerDialog> createState() => _HabitTimerDialogState();
+}
+
+class _HabitTimerDialogState extends State<HabitTimerDialog> {
+  late int _remaining;
+  Timer? _ticker;
+  bool _paused = false;
+  bool _closed = false;
+
+  int get _total => widget.habit.timerMinutes * 60;
+
+  @override
+  void initState() {
+    super.initState();
+    _remaining = _total;
+    _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (_paused || _closed) return;
+      setState(() {
+        if (_remaining > 0) _remaining--;
+      });
+      if (_remaining <= 0) _done();
+    });
+  }
+
+  void _done() {
+    if (_closed) return;
+    _closed = true;
+    _ticker?.cancel();
+    Navigator.pop(context, true);
+  }
+
+  @override
+  void dispose() {
+    _ticker?.cancel();
+    super.dispose();
+  }
+
+  String get _stamp {
+    final m = (_remaining ~/ 60).toString().padLeft(2, '0');
+    final s = (_remaining % 60).toString().padLeft(2, '0');
+    return '$m:$s';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final habit = widget.habit;
+    final primary = Theme.of(context).colorScheme.primary;
+    final brightness = Theme.of(context).brightness;
+    final progress =
+        _total == 0 ? 0.0 : ((_total - _remaining) / _total).clamp(0.0, 1.0);
+
+    return Dialog(
+      backgroundColor: cardColor(brightness),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(28)),
+      child: Padding(
+        padding: const EdgeInsets.all(26),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 54,
+              height: 54,
+              decoration: BoxDecoration(
+                color: primary.withAlpha(34),
+                borderRadius: BorderRadius.circular(16),
+              ),
+              child: Icon(habit.icon, color: primary, size: 28),
+            ),
+            const SizedBox(height: 10),
+            Text(habit.name,
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                    fontSize: 18, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 20),
+            SizedBox(
+              width: 170,
+              height: 170,
+              child: Stack(
+                alignment: Alignment.center,
+                children: [
+                  SizedBox(
+                    width: 170,
+                    height: 170,
+                    child: CircularProgressIndicator(
+                      value: progress,
+                      strokeWidth: 12,
+                      strokeCap: StrokeCap.round,
+                      backgroundColor: secondaryColor(brightness),
+                      color: primary,
+                    ),
+                  ),
+                  Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(_stamp,
+                          style: const TextStyle(
+                              fontSize: 42,
+                              fontWeight: FontWeight.bold,
+                              fontFeatures: [FontFeature.tabularFigures()])),
+                      const SizedBox(height: 2),
+                      Text(
+                          _remaining == 0
+                              ? t('تم ✅', 'Done ✅')
+                              : t('إنجاز سريع 💙', 'Stay with it 💙'),
+                          style: _remaining == 0
+                              ? const TextStyle(
+                                  color: Colors.green,
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.bold)
+                              : TextStyle(
+                                  color: Colors.grey.shade500, fontSize: 13)),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 22),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                IconButton.outlined(
+                  onPressed: _paused
+                      ? () => setState(() => _paused = false)
+                      : () => setState(() => _paused = true),
+                  icon: Icon(_paused ? Icons.play_arrow : Icons.pause),
+                  tooltip: _paused ? t('استئناف', 'Resume') : t('إيقاف مؤقت', 'Pause'),
+                ),
+                const SizedBox(width: 16),
+                IconButton.outlined(
+                  onPressed: () {
+                    _closed = true;
+                    Navigator.pop(context, false);
+                  },
+                  icon: const Icon(Icons.close),
+                  tooltip: t('إلغاء', 'Cancel'),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 }
 
 class HabitDetailPage extends StatefulWidget {
@@ -4403,7 +6053,6 @@ class _HabitDetailPageState extends State<HabitDetailPage> {
   int _currentStreak = 0;
   int _longestStreak = 0;
   int _total = 0;
-  int _rate30 = 0;
 
   @override
   void initState() {
@@ -4416,7 +6065,6 @@ class _HabitDetailPageState extends State<HabitDetailPage> {
     _currentStreak = habit.currentStreak();
     _longestStreak = habit.longestStreak();
     _total = habit.countCompletions();
-    _rate30 = habit.rateLastN(30);
   }
 
   Future<void> _recordNow() async {
@@ -4430,12 +6078,12 @@ class _HabitDetailPageState extends State<HabitDetailPage> {
       context: context,
       builder: (ctx) => AlertDialog(
         backgroundColor: cardColor(Theme.of(context).brightness),
-        title: Text(t('سجّل "${habit.name}"', 'Log "${habit.name}"')),
+        title: Text(t('سجّل "${iso(habit.name)}"', 'Log "${habit.name}"')),
         content: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
             Text(t(
-                'اليوم: ${_fmtD(recorded)} / ${_fmtD(habit.target)}${habit.unit.isEmpty ? '' : ' ${habit.unit}'}',
+                'اليوم: ${ltr('${_fmtD(recorded)} / ${_fmtD(habit.target)}')}${habit.unit.isEmpty ? '' : ' ${habit.unit}'}',
                 'Today: ${_fmtD(recorded)} / ${_fmtD(habit.target)}${habit.unit.isEmpty ? '' : ' ${habit.unit}'}')),
             const SizedBox(height: 12),
             TextField(
@@ -4460,7 +6108,7 @@ class _HabitDetailPageState extends State<HabitDetailPage> {
               children: [
                 for (final q in [1.0, 2.0, 5.0, 10.0])
                   ActionChip(
-                    label: Text('+${_fmtD(q)}'),
+                    label: Text(ltr('+${_fmtD(q)}')),
                     onPressed: () => Navigator.pop(ctx, q),
                   ),
               ],
@@ -4507,6 +6155,22 @@ class _HabitDetailPageState extends State<HabitDetailPage> {
     }
   }
 
+  Future<void> _startDetailTimer(Habit habit) async {
+    final now = DateTime.now();
+    if (habit.isDoneOn(now) || !mounted) return;
+    final finished = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => HabitTimerDialog(habit: habit),
+    );
+    if (finished != true || !mounted) return;
+    setState(() {
+      habit.completedDates.add(dayKey(now));
+      habit.setDoneAt(now);
+    });
+    _compute();
+    widget.onUpdate(habit);
+  }
+
   void _showLevelUp(int level) {
     showDialog(
       context: context,
@@ -4544,7 +6208,7 @@ class _HabitDetailPageState extends State<HabitDetailPage> {
         backgroundColor: cardColor(Theme.of(context).brightness),
         title: Text(t('حذف العادة؟', 'Delete habit?')),
         content: Text(t(
-            'حذف "${widget.habit.name}" وكل تاريخها؟ لا يمكن التراجع عن هذا.',
+            'حذف "${iso(widget.habit.name)}" وكل تاريخها؟ لا يمكن التراجع عن هذا.',
             'Delete "${widget.habit.name}" and all its history? This cannot be undone.')),
         actions: [
           TextButton(
@@ -4598,6 +6262,8 @@ class _HabitDetailPageState extends State<HabitDetailPage> {
                       ..target = h.target
                       ..unit = h.unit
                       ..isQuit = h.isQuit
+                      ..isTimer = h.isTimer
+                      ..timerMinutes = h.timerMinutes
                       ..reminderEnabled = h.reminderEnabled
                       ..reminderHour = h.reminderHour
                       ..reminderMinute = h.reminderMinute;
@@ -4662,7 +6328,7 @@ class _HabitDetailPageState extends State<HabitDetailPage> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    t('اليوم: ${_fmtD(habit.amountOn(today))} / ${_fmtD(habit.target)}${habit.unit.isEmpty ? '' : ' ${habit.unit}'}',
+                    t('اليوم: ${ltr('${_fmtD(habit.amountOn(today))} / ${_fmtD(habit.target)}')}${habit.unit.isEmpty ? '' : ' ${habit.unit}'}',
                         'Today: ${_fmtD(habit.amountOn(today))} / ${_fmtD(habit.target)}${habit.unit.isEmpty ? '' : ' ${habit.unit}'}'),
                     style: const TextStyle(fontSize: 15),
                   ),
@@ -4697,20 +6363,48 @@ class _HabitDetailPageState extends State<HabitDetailPage> {
             ),
           ],
           const SizedBox(height: 16),
+          if (habit.isTimerHabit) ...[
+            Container(
+              padding: const EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                color: primary.withAlpha(24),
+                borderRadius: BorderRadius.circular(16),
+              ),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      t('عادة مؤقت ⏱️ — ${habit.timerMinutes} ${t('دقيقة', 'min')}',
+                          'Timer habit ⏱️ — ${habit.timerMinutes} min'),
+                      style: const TextStyle(fontSize: 15),
+                    ),
+                  ),
+                  FilledButton.icon(
+                    icon: const Icon(Icons.play_arrow, size: 18),
+                    label: Text(habit.isDoneOn(today)
+                        ? t('تم اليوم ✅', 'Done today ✅')
+                        : t('ابدأ المؤقت', 'Start timer')),
+                    onPressed: habit.isDoneOn(today)
+                        ? null
+                        : () => _startDetailTimer(habit),
+                  ),
+                ],
+              ),
+            ),
+          ],
+          const SizedBox(height: 16),
           Row(
             children: [
               _StatCard(
                 title: t('السلسلة الحالية', 'Current streak'),
-                value: t('$_currentStreak يوم',
-                    '$_currentStreak ${_currentStreak == 1 ? 'day' : 'days'}'),
+                value: daysLabel(_currentStreak),
                 icon: Icons.local_fire_department,
                 color: Colors.orange,
               ),
               const SizedBox(width: 12),
               _StatCard(
                 title: t('أطول سلسلة', 'Longest streak'),
-                value: t('$_longestStreak يوم',
-                    '$_longestStreak ${_longestStreak == 1 ? 'day' : 'days'}'),
+                value: daysLabel(_longestStreak),
                 icon: Icons.emoji_events,
                 color: primary,
               ),
@@ -4727,10 +6421,11 @@ class _HabitDetailPageState extends State<HabitDetailPage> {
               ),
               const SizedBox(width: 12),
               _StatCard(
-                title: t('آخر 30 يوم', 'Last 30 days'),
-                value: '$_rate30%',
-                icon: Icons.percent,
-                color: Colors.blue,
+                title: t('العودات 💛', 'Comebacks 💛'),
+                value:
+                    '${habit.countComebacks()} ${t('عودة', 'comeback')}',
+                icon: Icons.wb_twilight,
+                color: const Color(0xFFFFB74D),
               ),
             ],
           ),
@@ -4752,7 +6447,7 @@ class _HabitDetailPageState extends State<HabitDetailPage> {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: List.generate(12, (col) {
                     return Padding(
-                      padding: const EdgeInsets.only(right: 4),
+                      padding: const EdgeInsetsDirectional.only(end: 4),
                       child: Column(
                         children: List.generate(7, (row) {
                           final day = addDays(start, col * 7 + row);
@@ -4858,10 +6553,11 @@ class _StatsPageState extends State<StatsPage> {
     final primary = Theme.of(context).colorScheme.primary;
     final brightness = Theme.of(context).brightness;
     final week = _last7DaysPercent();
-    // Bars run oldest → today, so label each one with its own weekday.
+    // Bars are the last 7 days ending today, so bar i is (today - (6 - i))
+    // and today is always the last bar.
     const todayIndex = 6;
-    final barDays =
-        List.generate(7, (i) => addDays(clock(), -(6 - i)));
+    String barLabel(int i) =>
+        weekdayShortLabel(addDays(clock(), -(6 - i)).weekday);
     final totalCompletions = habits.fold<int>(
         0, (sum, h) => sum + h.countCompletions());
 
@@ -4894,6 +6590,53 @@ class _StatsPageState extends State<StatsPage> {
     final bestW = wd.entries.reduce((a, b) => a.value >= b.value ? a : b).key;
     final unlocked = _unlockedBadges;
 
+    final now = DateTime.now();
+    final weekStart = Habit.mondayOf(now);
+    var dueWeek = 0, doneWeek = 0;
+    final dayTotals = <int, int>{};
+    for (final h in habits) {
+      for (var i = 0; i < 7; i++) {
+        final day = addDays(weekStart, i);
+        if (day.isAfter(now)) continue;
+        if (h.isDueOn(day)) {
+          dueWeek++;
+          if (h.isDoneOn(day)) {
+            doneWeek++;
+            dayTotals[day.weekday] = (dayTotals[day.weekday] ?? 0) + 1;
+          }
+        }
+      }
+    }
+    final weekRate = dueWeek == 0 ? 0 : (doneWeek * 100 / dueWeek).round();
+    int bestWeekday = 1;
+    for (final e in dayTotals.entries) {
+      if (e.value > (dayTotals[bestWeekday] ?? 0)) bestWeekday = e.key;
+    }
+    final bestDayTotal = dayTotals[bestWeekday] ?? 0;
+    Habit? weekBestHabit;
+    var weekBestDays = 0;
+    for (final h in habits) {
+      var cnt = 0;
+      for (var i = 0; i < 7; i++) {
+        final day = addDays(weekStart, i);
+        if (!day.isAfter(now) && h.isDoneOn(day)) cnt++;
+      }
+      if (cnt >= weekBestDays && cnt > 0) {
+        weekBestDays = cnt;
+        weekBestHabit = h;
+      }
+    }
+    final weekComebacks = <String>[];
+    for (final h in habits) {
+      for (var i = 0; i < 7; i++) {
+        final day = addDays(weekStart, i);
+        if (!day.isAfter(now) && h.isComebackOn(day)) {
+          weekComebacks.add(h.name);
+          break;
+        }
+      }
+    }
+
     final achievements = BadgeSystem.all().map((b) {
       final earned = b.earned(habits, _level, _xp);
       return (b.icon, b.title, b.desc, earned && unlocked.contains(b.id));
@@ -4921,7 +6664,7 @@ class _StatsPageState extends State<StatsPage> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(t('المستوى $_level · $_xp XP', 'Level $_level · $_xp XP'),
+                      Text(t('المستوى $_level · ${ltr('$_xp XP')}', 'Level $_level · $_xp XP'),
                           style: const TextStyle(
                               fontWeight: FontWeight.bold, fontSize: 15)),
                       const SizedBox(height: 6),
@@ -4947,15 +6690,14 @@ class _StatsPageState extends State<StatsPage> {
             children: [
               _StatCard(
                 title: t('السلسلة الحالية', 'Current streak'),
-                value: t('$currentStreakAny يوم',
-                    '$currentStreakAny ${currentStreakAny == 1 ? 'day' : 'days'}'),
+                value: daysLabel(currentStreakAny),
                 icon: Icons.local_fire_department,
                 color: Colors.deepOrange,
               ),
               const SizedBox(width: 12),
               _StatCard(
                 title: t('أفضل سلسلة', 'Best streak'),
-                value: t('$bestStreak يوم', '$bestStreak ${bestStreak == 1 ? 'day' : 'days'}'),
+                value: daysLabel(bestStreak),
                 icon: Icons.emoji_events,
                 color: Colors.amber,
               ),
@@ -4978,6 +6720,90 @@ class _StatsPageState extends State<StatsPage> {
                 color: Colors.green,
               ),
             ],
+          ),
+
+          _ProSection(
+            title: t('التحليلات المتقدمة (أسبوعي وشهري) 📊', 'Advanced analytics (weekly & monthly) 📊'),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [          const SizedBox(height: 24),
+          Container(
+            padding: const EdgeInsets.all(18),
+            decoration: BoxDecoration(
+              color: cardColor(brightness),
+              borderRadius: BorderRadius.circular(18),
+              border: Border.all(
+                  color: primary.withAlpha(70),
+                  width: 1.2),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Icon(Icons.yard, color: primary, size: 22),
+                    const SizedBox(width: 8),
+                    Text(
+                      t('ملخص أسبوعك 🎯', 'This week recap 🎯'),
+                      style: const TextStyle(
+                          fontSize: 18, fontWeight: FontWeight.bold),
+                    ),
+                    const Spacer(),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 12, vertical: 6),
+                      decoration: BoxDecoration(
+                        color: primary.withAlpha(24),
+                        borderRadius: BorderRadius.circular(14),
+                      ),
+                      child: Text(
+                        '$weekRate%',
+                        style: TextStyle(
+                            color: primary,
+                            fontWeight: FontWeight.bold,
+                            fontSize: 15),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  t(
+                    dueWeek == 0
+                        ? 'لم تعد أي مهمة هذا الأسبوع بعد — أضف عاداتك أولاً.'
+                        : 'أنجزت $doneWeek من $dueWeek مهمة مجدولة. ${weekRate == 100 ? 'أسبوع مثالي 👏' : 'كمّل وكسر رقمك بالأيام الجاية.'}',
+                    dueWeek == 0
+                        ? 'No tasks were due this week yet — add habits first.'
+                        : 'Completed $doneWeek of $dueWeek scheduled. ${weekRate == 100 ? 'Perfect week 👏' : 'Keep going and beat it next week.'}',
+                  ),
+                  style: TextStyle(
+                      color: Colors.grey.shade500, fontSize: 13, height: 1.5),
+                ),
+                const SizedBox(height: 12),
+                if (bestDayTotal > 0)
+                  _RecapLine(
+                    icon: Icons.star,
+                    text: t(
+                        'أقوى يوم: ${weekdayName(bestWeekday)} ($bestDayTotal إنجاز)',
+                        'Strongest day: ${weekdayName(bestWeekday)} ($bestDayTotal done)'),
+                  ),
+                if (weekBestHabit != null)
+                  _RecapLine(
+                    icon: Icons.check_circle,
+                    text: t(
+                        'الثابت الكبير: "${iso(weekBestHabit.name)}" — ${daysAr(weekBestDays)}',
+                        'Rock of the week: "${weekBestHabit.name}" — $weekBestDays day(s)'),
+                  ),
+                if (weekComebacks.isNotEmpty)
+                  _RecapLine(
+                    icon: Icons.wb_twilight,
+                    color: const Color(0xFFFFB74D),
+                    text: t(
+                        'عودة تستحق التهنئة 💛 — رجعت لـ${weekComebacks.length > 1 ? '${weekComebacks.length} عادات' : weekComebacks.first}',
+                        'Comebacks deserve a cheer 💛 — back at ${weekComebacks.length > 1 ? '${weekComebacks.length} habits' : weekComebacks.first}'),
+                  ),
+              ],
+            ),
           ),
           const SizedBox(height: 24),
           Container(
@@ -5006,7 +6832,7 @@ class _StatsPageState extends State<StatsPage> {
                     sideTitles: SideTitles(
                       showTitles: true,
                       getTitlesWidget: (value, meta) => Text(
-                        dayAxisLabel(barDays[value.toInt()].weekday % 7),
+                        barLabel(value.toInt()),
                         style: TextStyle(
                           color: value.toInt() == todayIndex
                               ? primary
@@ -5119,6 +6945,53 @@ class _StatsPageState extends State<StatsPage> {
                   );
                 }),
               ),
+            ),
+          ),
+          const SizedBox(height: 24),
+          Text(t('أسبوعك بنظرة واحدة 🗓️', 'Your weeks at a glance 🗓️'),
+              style:
+                  const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 12),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: cardColor(brightness),
+              borderRadius: BorderRadius.circular(16),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                WeekGrid(
+                  habits: habits,
+                  primary: primary,
+                  bg: secondaryColor(brightness),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  t('كل نقطة يوم — أكثر لمعاناً يعني إنجاز عادات أكثر.',
+                      'Every dot is a day — brighter means more habits completed.'),
+                  style: TextStyle(color: Colors.grey.shade500, fontSize: 12),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 24),
+          Text(t('شهرك الحالي 📅', 'This month 📅'),
+              style:
+                  const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 12),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: cardColor(brightness),
+              borderRadius: BorderRadius.circular(16),
+            ),
+            child: MonthHeatmap(
+              habits: habits,
+              primary: primary,
+              bg: secondaryColor(brightness),
             ),
           ),
           const SizedBox(height: 24),
@@ -5266,7 +7139,7 @@ class _StatsPageState extends State<StatsPage> {
                               t('$hRate30% آخر 30 يوم · إجمالي $hTotal',
                                   '$hRate30% last 30 days · $hTotal total') +
                                   (h.isMeasurable
-                                      ? ' · ${h.target.toStringAsFixed(h.target.truncateToDouble() == h.target ? 0 : 1)} ${h.unit.trim()}'
+                                      ? ' · ${ltr(h.target.toStringAsFixed(h.target.truncateToDouble() == h.target ? 0 : 1))} ${h.unit.trim()}'
                                       : ''),
                               style: TextStyle(
                                   fontSize: 12, color: Colors.grey.shade500)),
@@ -5349,6 +7222,34 @@ class _StatsPageState extends State<StatsPage> {
               },
             ),
           ),
+
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _RecapLine extends StatelessWidget {
+  final IconData icon;
+  final String text;
+  final Color? color;
+  const _RecapLine({required this.icon, required this.text, this.color});
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 6),
+      child: Row(
+        children: [
+          Icon(icon, size: 15, color: color ?? Colors.grey.shade600),
+          const SizedBox(width: 7),
+          Expanded(
+            child: Text(text,
+                style: const TextStyle(fontSize: 13, height: 1.4)),
+          ),
         ],
       ),
     );
@@ -5389,6 +7290,205 @@ class _StatCard extends StatelessWidget {
           ],
         ),
       ),
+    );
+  }
+}
+
+class WeekGrid extends StatelessWidget {
+  final List<Habit> habits;
+  final Color primary;
+  final Color bg;
+  final int weeks;
+  const WeekGrid({
+    super.key,
+    required this.habits,
+    required this.primary,
+    required this.bg,
+    this.weeks = 6,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final now = DateTime.now();
+    final start = addDays(Habit.mondayOf(now), -(7 * (weeks - 1)));
+    return Column(
+      children: [
+        Row(
+          children: [
+            const SizedBox(width: 42),
+            for (var w = 0; w < 7; w++) ...[
+              Expanded(
+                child: Center(
+                  child: Text(
+                    weekdayShortLabel(w == 6 ? 7 : w + 1),
+                    style: TextStyle(fontSize: 10, color: Colors.grey.shade500),
+                  ),
+                ),
+              ),
+            ],
+          ],
+        ),
+        const SizedBox(height: 4),
+        for (var wi = 0; wi < weeks; wi++)
+          Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: Row(
+              children: [
+                SizedBox(
+                  width: 42,
+                  child: Text(
+                    '${addDays(start, wi * 7).day}/${addDays(start, wi * 7).month}',
+                    style: TextStyle(fontSize: 9, color: Colors.grey.shade400),
+                  ),
+                ),
+                for (var d = 0; d < 7; d++) ...[
+                  Expanded(
+                    child: Center(
+                      child: Container(
+                        width: 20,
+                        height: 20,
+                        decoration: BoxDecoration(
+                          color: heatColor(
+                            dayRate(habits,
+                                addDays(start, wi * 7 + d)),
+                            primary,
+                            bg,
+                          ),
+                          borderRadius: BorderRadius.circular(5),
+                          border: sameDay(addDays(start, wi * 7 + d), now)
+                              ? Border.all(color: primary, width: 1.6)
+                              : null,
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+class MonthHeatmap extends StatelessWidget {
+  final List<Habit> habits;
+  final Color primary;
+  final Color bg;
+  const MonthHeatmap({
+    super.key,
+    required this.habits,
+    required this.primary,
+    required this.bg,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final now = DateTime.now();
+    final first = DateTime(now.year, now.month, 1);
+    final last = DateTime(now.year, now.month + 1, 0);
+    final start = Habit.mondayOf(first);
+    final dark = Theme.of(context).brightness == Brightness.dark;
+    final rows = <Widget>[];
+    for (var d = start;
+        d.isBefore(addDays(last, 1));
+        d = addDays(d, 7)) {
+      rows.add(
+        Row(
+          children: [
+            for (var i = 0; i < 7; i++)
+              Expanded(
+                child: AspectRatio(
+                  aspectRatio: 1,
+                  child: () {
+                    final date = addDays(d, i);
+                    if (date.month != now.month) return const SizedBox.shrink();
+                    final rate = dayRate(habits, date);
+                    return Container(
+                      margin: const EdgeInsets.all(1.5),
+                      decoration: BoxDecoration(
+                        color: heatColor(rate, primary, bg),
+                        borderRadius: BorderRadius.circular(5),
+                        border: sameDay(date, now)
+                            ? Border.all(color: primary, width: 1.8)
+                            : null,
+                      ),
+                      child: Center(
+                        child: Text(
+                          '${date.day}',
+                          style: TextStyle(
+                            fontSize: 9.5,
+                            color: rate > 50
+                                ? Colors.white
+                                : (dark ? Colors.white70 : Colors.black54),
+                            fontWeight:
+                                sameDay(date, now) ? FontWeight.bold : FontWeight.normal,
+                          ),
+                        ),
+                      ),
+                    );
+                  }(),
+                ),
+              ),
+          ],
+        ),
+      );
+    }
+    return Column(
+      children: [
+        // No leading spacer: the day rows below have none, so headers line
+        // up with their columns.
+        Row(
+          children: [
+            for (var w = 0; w < 7; w++) ...[
+              Expanded(
+                child: Center(
+                  child: Text(
+                    weekdayShortLabel(w == 6 ? 7 : w + 1),
+                    style: TextStyle(fontSize: 10, color: Colors.grey.shade500),
+                  ),
+                ),
+              ),
+            ],
+          ],
+        ),
+        const SizedBox(height: 4),
+        for (final r in rows) r,
+        const SizedBox(height: 10),
+        Row(
+          children: [
+            Text(
+              t('أقل', 'Less'),
+              style: TextStyle(fontSize: 10, color: Colors.grey.shade500),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Container(
+                height: 12,
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(6),
+                  // Runs from the "Less" label to the "More" label in both
+                  // LTR and RTL.
+                  gradient: LinearGradient(
+                    begin: AlignmentDirectional.centerStart,
+                    end: AlignmentDirectional.centerEnd,
+                    colors: [
+                      bg,
+                      primary.withAlpha(24 + (25 * 2.2).round()),
+                      primary.withAlpha(255),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Text(
+              t('أكثر', 'More'),
+              style: TextStyle(fontSize: 10, color: Colors.grey.shade500),
+            ),
+          ],
+        ),
+      ],
     );
   }
 }
@@ -5450,10 +7550,15 @@ class YearHeatmap extends StatelessWidget {
                   for (var c = 0; c < colCount; c++)
                     SizedBox(
                       width: step,
+                      // Month labels are wider than one column; let them
+                      // run into the next (empty) columns instead of
+                      // wrapping letter by letter.
                       child: Text(
                         label(c) ?? '',
                         style: const TextStyle(fontSize: 8),
-                        overflow: TextOverflow.clip,
+                        maxLines: 1,
+                        softWrap: false,
+                        overflow: TextOverflow.visible,
                       ),
                     ),
                 ],
@@ -5552,77 +7657,199 @@ class _SettingsPageState extends State<SettingsPage> {
   }
 
   Future<void> _exportBackup() async {
-    final prefs = await SharedPreferences.getInstance();
-    final raw = prefs.getString('habits') ?? '[]';
-    await Clipboard.setData(ClipboardData(text: raw));
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-            content: Text(t('تم نسخ النسخة الاحتياطية! احفظها في مكان آمن 📋',
-                'Backup copied! Store it somewhere safe 📋'))),
-      );
+    if (!AuthService.isProUser) {
+      if (mounted) {
+        showProUpgrade(context,
+            message: t(
+                'عمل نسخة احتياطية كاملة بالملفات 🔒 من مميزات برو.',
+                'Full file-based backup 🔒 is a Pro feature.'));
+      }
+      return;
     }
-  }
-
-  Future<void> _restoreBackup() async {
-    final controller = TextEditingController();
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: cardColor(Theme.of(context).brightness),
-        title: Text(t('استعادة نسخة احتياطية', 'Restore backup')),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text(t('الصق نص النسخة الاحتياطية أدناه. سيتم استبدال عاداتك الحالية.',
-                'Paste your backup text below. Your current habits will be replaced.')),
-            const SizedBox(height: 12),
-            TextField(
-              controller: controller,
-              maxLines: 6,
-              decoration: softInputDecoration(ctx,
-                  hint: '[{"name": "...", ...}]'),
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: Text(t('إلغاء', 'Cancel')),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            child: Text(t('استعادة', 'Restore')),
-          ),
-        ],
-      ),
-    );
-
-    if (confirmed != true) return;
-
     try {
-      final list = jsonDecode(controller.text) as List;
-      final habits = list
-          .map((e) => Habit.fromMap(Map<String, dynamic>.from(e)))
-          .toList();
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setString(
-          'habits', jsonEncode(habits.map((h) => h.toMap()).toList()));
-      HomePage.reload?.call();
-      refreshWidget();
-      // Settings is a tab of the main shell, not a pushed route: popping here
-      // used to remove the app's only route and leave a black screen.
+      final email = AuthService.email;
+
+      final moodMap = <String, int>{};
+      final now = DateTime.now();
+      for (var i = 0; i < 730; i++) {
+        final d = addDays(now, -i);
+        final k = 'mood_${email ?? 'guest'}_${dayKey(d)}';
+        final v = prefs.getInt(k);
+        if (v != null) moodMap[dayKey(d)] = v;
+      }
+
+      final payload = <String, dynamic>{
+        'app': 'HabitFlow',
+        'version': 2,
+        'exportedAt': DateTime.now().toIso8601String(),
+        'habits': jsonDecode(prefs.getString('habits') ?? '[]'),
+        'xp': prefs.getInt('xp_$email') ?? 0,
+        'darkMode': prefs.getBool('darkMode') ?? true,
+        'themeColor': prefs.getInt('themeColor') ?? 0,
+        'themeCustom': prefs.getInt('themeCustom'),
+        'reminderEnabled': prefs.getBool('reminderEnabled') ?? false,
+        'reminderHour': prefs.getInt('reminderHour') ?? 20,
+        'reminderMinute': prefs.getInt('reminderMinute') ?? 0,
+        'mood_history': moodMap,
+      };
+
+      final dir = await getTemporaryDirectory();
+      final file = File(
+          '${dir.path}/habitflow_${DateTime.now().millisecondsSinceEpoch}.json');
+      await file.writeAsString(jsonEncode(payload));
+
+      await SharePlus.instance.share(
+        ShareParams(
+          files: [XFile(file.path, mimeType: 'application/json')],
+          subject: 'HabitFlow Backup',
+          text: t(
+              'نسخة احتياطية كاملة من HabitFlow 🗂️ — يمكنك استعادتها من الإعدادات.',
+              'Full HabitFlow backup 🗂️ — restore it from Settings.'),
+        ),
+      );
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-              content: Text(t('تمت استعادة ${habits.length} عادة بنجاح ✅',
-                  'Restored ${habits.length} habits successfully ✅'))),
+              content: Text(t('تم تجهيز النسخة الاحتياطية! 📤',
+                  'Backup file ready! 📤'))),
         );
       }
     } catch (_) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(t('بيانات غير صالحة ❌', 'Invalid data ❌'))),
+          SnackBar(
+              content: Text(t('تعذر إنشاء النسخة الاحتياطية ❌',
+                  'Could not create backup ❌'))),
+        );
+      }
+    }
+  }
+
+  Future<void> _restoreBackup() async {
+    if (!AuthService.isProUser) {
+      if (mounted) {
+        showProUpgrade(context,
+            message: t(
+                'استعادة نسخة احتياطية بالملفات 🔒 من مميزات برو.',
+                'Restoring from a file 🔒 is a Pro feature.'));
+      }
+      return;
+    }
+    final res = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['json'],
+      withData: true,
+    );
+    final picked = res?.files.firstOrNull;
+    if (picked == null) return;
+
+    try {
+      final text = picked.bytes != null
+          ? utf8.decode(picked.bytes!)
+          : await File(picked.path!).readAsString();
+      final decoded = jsonDecode(text);
+
+      final prefs = await SharedPreferences.getInstance();
+
+      if (decoded is List) {
+        final habits = decoded
+            .map((e) => Habit.fromMap(Map<String, dynamic>.from(e)))
+            .toList();
+        await prefs.setString(
+            'habits', jsonEncode(habits.map((h) => h.toMap()).toList()));
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+                content: Text(
+                    t('تمت استعادة ${habitsAr(habits.length)} بنجاح ✅',
+                        'Restored ${habits.length} habits successfully ✅'))),
+          );
+          await _load();
+        }
+        HomePage.reload?.call();
+        return;
+      }
+
+      if (decoded is Map && decoded['app'] == 'HabitFlow') {
+        final email = AuthService.email;
+        final habits = (decoded['habits'] as List)
+            .map((e) => Habit.fromMap(Map<String, dynamic>.from(e)))
+            .toList();
+        await prefs.setString(
+            'habits', jsonEncode(habits.map((h) => h.toMap()).toList()));
+        if (decoded['xp'] is int) {
+          await prefs.setInt(
+              'xp_$email', decoded['xp'] as int);
+        }
+        if (decoded['darkMode'] is bool) {
+          await prefs.setBool('darkMode', decoded['darkMode'] as bool);
+        }
+        if (decoded['themeColor'] is int) {
+          await prefs.setInt('themeColor', decoded['themeColor'] as int);
+        }
+        if (decoded['themeCustom'] is int) {
+          await prefs.setInt('themeCustom', decoded['themeCustom'] as int);
+        }
+        if (decoded['reminderEnabled'] is bool) {
+          await prefs.setBool(
+              'reminderEnabled', decoded['reminderEnabled'] as bool);
+        }
+        if (decoded['reminderHour'] is int) {
+          await prefs.setInt('reminderHour', decoded['reminderHour'] as int);
+        }
+        if (decoded['reminderMinute'] is int) {
+          await prefs.setInt(
+              'reminderMinute', decoded['reminderMinute'] as int);
+        }
+        if (decoded['mood_history'] is Map) {
+          (decoded['mood_history'] as Map).forEach((k, v) {
+            if (v is int) {
+              prefs.setInt('mood_${email ?? 'guest'}_$k', v);
+            }
+          });
+        }
+        if (mounted) {
+          if (decoded['darkMode'] is bool) {
+            HabitFlowApp.of(context)
+                ?.setDarkMode(decoded['darkMode'] as bool);
+          }
+          if (decoded['themeColor'] is int) {
+            final tc = decoded['themeColor'] as int;
+            if (tc < 0 && decoded['themeCustom'] is int) {
+              HabitFlowApp.of(context)
+                  ?.setCustomTheme(Color(decoded['themeCustom'] as int));
+            } else {
+              HabitFlowApp.of(context)?.setTheme(tc);
+            }
+          }
+          final xpV = decoded['xp'] is int ? decoded['xp'] as int : 0;
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+                content: Text(t(
+                    'تمت استعادة ${habitsAr(habits.length)} وكل بياناتك ✅ (${ltr('$xpV XP')})',
+                    'Restored ${habits.length} habits and all your data ✅ ($xpV XP)'))),
+          );
+          await _load();
+        }
+        HomePage.reload?.call();
+        return;
+      }
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+              content: Text(t('هذا الملف ليس نسخة احتياطية صالحة ❌',
+                  'This file is not a valid backup ❌'))),
+        );
+      }
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+              content: Text(
+                  t('تعذر قراءة الملف — تأكد أنه نسخة HabitFlow ❌',
+                      'Could not read the file — make sure it’s a HabitFlow backup ❌'))),
         );
       }
     }
@@ -5641,8 +7868,12 @@ class _SettingsPageState extends State<SettingsPage> {
       body: ListView(
         padding: const EdgeInsets.all(20),
         children: [
-          if (!AuthService.isProUser)
-            Container(
+if (!AuthService.isProUser)
+          Material(
+            color: Colors.transparent,
+            borderRadius: BorderRadius.circular(16),
+            clipBehavior: Clip.antiAlias,
+            child: Container(
               margin: const EdgeInsets.only(bottom: 16),
               padding: const EdgeInsets.all(16),
               decoration: BoxDecoration(
@@ -5660,8 +7891,41 @@ class _SettingsPageState extends State<SettingsPage> {
                         color: Colors.white,
                         fontSize: 17,
                         fontWeight: FontWeight.bold)),
-                subtitle: Text(t('بلا إعلانات • عادات غير محدودة • \$2.99/شهر',
-                    'No ads • Unlimited habits • \$2.99/month'),
+                subtitle: Text(t('بلا إعلانات • عادات غير محدودة • اشتراك شهري',
+                    'No ads • Unlimited habits • Monthly subscription'),
+                    style: TextStyle(color: Colors.white.withAlpha(220))),
+                trailing: const Icon(Icons.arrow_forward_ios,
+                    color: Colors.white, size: 14),
+onTap: () => Navigator.push(context,
+                  MaterialPageRoute(builder: (_) => const ProPage())),
+              ),
+            ),
+          )
+else if (AuthService.isProUser)
+          Material(
+            color: Colors.transparent,
+            borderRadius: BorderRadius.circular(16),
+            clipBehavior: Clip.antiAlias,
+            child: Container(
+              margin: const EdgeInsets.only(bottom: 16),
+              padding: const EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  colors: [Colors.green.shade700, primary],
+                ),
+                borderRadius: BorderRadius.circular(16),
+              ),
+              child: ListTile(
+                contentPadding: EdgeInsets.zero,
+                leading: const Icon(Icons.workspace_premium,
+                    color: Colors.white, size: 34),
+                title: Text(t('أنت برو', 'You are Pro'),
+                    style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 17,
+                        fontWeight: FontWeight.bold)),
+                subtitle: Text(t('إدارة اشتراكك أو الرجوع للنسخة المجانية',
+                    'Manage your subscription or go back to the free version'),
                     style: TextStyle(color: Colors.white.withAlpha(220))),
                 trailing: const Icon(Icons.arrow_forward_ios,
                     color: Colors.white, size: 14),
@@ -5669,14 +7933,13 @@ class _SettingsPageState extends State<SettingsPage> {
                     MaterialPageRoute(builder: (_) => const ProPage())),
               ),
             ),
-          Container(
-            padding: const EdgeInsets.all(16),
-            decoration: BoxDecoration(
-              color: cardColor(brightness),
-              borderRadius: BorderRadius.circular(16),
-            ),
+          ),
+          Material(
+            color: cardColor(brightness),
+            borderRadius: BorderRadius.circular(16),
+            clipBehavior: Clip.antiAlias,
             child: ListTile(
-              contentPadding: EdgeInsets.zero,
+              contentPadding: const EdgeInsets.symmetric(horizontal: 16),
               leading: Icon(Icons.translate, color: primary),
               title: Text(t('اللغة', 'Language'),
                   style: const TextStyle(
@@ -5707,149 +7970,223 @@ class _SettingsPageState extends State<SettingsPage> {
                     style:
                         const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
                 const SizedBox(height: 16),
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceAround,
-                  children: List.generate(palette.length, (i) {
-                    final selected =
-                        HabitFlowApp.of(context)?._seed == palette[i];
-                    return GestureDetector(
-                      onTap: () {
-                        if (!AuthService.isProUser) {
-                          showProUpgrade(context,
-                              message: t('ألوان التطبيق المخصصة من مميزات برو.',
-                                  'Custom app colors are a Pro feature.'));
-                          return;
-                        }
-                        HabitFlowApp.of(context)?.setTheme(i);
-                      },
-                      child: AnimatedContainer(
-                        duration: const Duration(milliseconds: 200),
-                        width: 52,
-                        height: 52,
-                        decoration: BoxDecoration(
-                          shape: BoxShape.circle,
-                          color: palette[i],
-                          border: selected
-                              ? Border.all(
-                                  color: brightness == Brightness.dark
-                                      ? Colors.white
-                                      : Colors.black,
-                                  width: 3)
-                              : null,
+                Wrap(
+                  spacing: 14,
+                  runSpacing: 14,
+                  children: [
+                    for (var i = 0; i < palette.length; i++)
+                      Builder(builder: (context) {
+                        final selected =
+                            HabitFlowApp.of(context)?._seed == palette[i] &&
+                                HabitFlowApp.of(context)?._customTheme != true;
+                        return GestureDetector(
+                          onTap: () => HabitFlowApp.of(context)?.setTheme(i),
+                          child: AnimatedContainer(
+                            duration: const Duration(milliseconds: 200),
+                            width: 52,
+                            height: 52,
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              color: palette[i],
+                              border: selected
+                                  ? Border.all(
+                                      color: brightness == Brightness.dark
+                                          ? Colors.white
+                                          : Colors.black,
+                                      width: 3)
+                                  : null,
+                            ),
+                            child: selected
+                                ? const Icon(Icons.check,
+                                    color: Colors.white, size: 26)
+                                : null,
+                          ),
+                        );
+                      }),
+                    Builder(builder: (context) {
+                      final customSelected =
+                          HabitFlowApp.of(context)?._customTheme == true;
+                      return GestureDetector(
+                        onTap: () async {
+                          if (!AuthService.isProUser) {
+                            showProUpgrade(
+                                context,
+                                message: t(
+                                    'اختيار لون مخصص للتطبيق من مميزات برو.',
+                                    'Picking a custom app colour is a Pro feature.'));
+                            return;
+                          }
+                          final current =
+                              HabitFlowApp.of(context)?._seed ?? palette[0];
+                          final picked = await showDialog<Color>(
+                            context: context,
+                            builder: (ctx) =>
+                                _ColorWheelDialog(initial: current),
+                          );
+                          if (picked != null && context.mounted) {
+                            HabitFlowApp.of(context)?.setCustomTheme(picked);
+                          }
+                        },
+                        child: Stack(
+                          children: [
+                            AnimatedContainer(
+                              duration: const Duration(milliseconds: 200),
+                              width: 52,
+                              height: 52,
+                              decoration: BoxDecoration(
+                                shape: BoxShape.circle,
+                                gradient: const SweepGradient(colors: [
+                                  Color(0xFFFF0000),
+                                  Color(0xFFFFFF00),
+                                  Color(0xFF00FF00),
+                                  Color(0xFF00FFFF),
+                                  Color(0xFF0000FF),
+                                  Color(0xFFFF00FF),
+                                  Color(0xFFFF0000),
+                                ]),
+                                border: customSelected
+                                    ? Border.all(
+                                        color: brightness == Brightness.dark
+                                            ? Colors.white
+                                            : Colors.black,
+                                        width: 3)
+                                    : null,
+                              ),
+                              child: Icon(
+                                customSelected
+                                    ? Icons.check
+                                    : Icons.colorize_rounded,
+                                color: Colors.white,
+                                size: 22,
+                              ),
+                            ),
+                            if (!AuthService.isProUser)
+                              Positioned(
+                                right: 0,
+                                bottom: 0,
+                                child: Container(
+                                  padding: const EdgeInsets.all(3),
+                                  decoration: BoxDecoration(
+                                    color: Theme.of(context)
+                                        .colorScheme
+                                        .tertiary,
+                                    shape: BoxShape.circle,
+                                  ),
+                                  child: const Icon(Icons.lock,
+                                      size: 11, color: Colors.white),
+                                ),
+                              ),
+                          ],
                         ),
-                        child: selected
-                            ? const Icon(Icons.check,
-                                color: Colors.white, size: 26)
-                            : null,
-                      ),
-                    );
-                  }),
+                      );
+                    }),
+                  ],
                 ),
               ],
             ),
           ),
           const SizedBox(height: 16),
-          Container(
-            padding: const EdgeInsets.all(16),
-            decoration: BoxDecoration(
-              color: cardColor(brightness),
-              borderRadius: BorderRadius.circular(16),
-            ),
-            child: Column(
-              children: [
-                SwitchListTile(
-                  contentPadding: EdgeInsets.zero,
-                  title: Text(t('تذكير يومي', 'Daily reminder'),
-                      style: const TextStyle(
-                          fontSize: 18, fontWeight: FontWeight.bold)),
-                  subtitle: Text(t('يصلك إشعار كل يوم',
-                      'You get a notification every day')),
-                  value: reminderOn,
-                  activeThumbColor: primary,
-                  onChanged: _toggleReminder,
-                ),
-                Divider(color: dividerColor(brightness)),
-                ListTile(
-                  contentPadding: EdgeInsets.zero,
-                  leading: const Icon(Icons.alarm),
-                  title: Text(t('وقت التذكير', 'Reminder time')),
-                  trailing: Text(
-                    reminderTime.format(context),
-                    style: TextStyle(
-                        fontSize: 16,
-                        fontWeight: FontWeight.bold,
-                        color: primary),
+          Material(
+            color: cardColor(brightness),
+            borderRadius: BorderRadius.circular(16),
+            clipBehavior: Clip.antiAlias,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+              child: Column(
+                children: [
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: Text(t('تذكير يومي', 'Daily reminder'),
+                        style: const TextStyle(
+                            fontSize: 18, fontWeight: FontWeight.bold)),
+                    subtitle: Text(t('يصلك إشعار كل يوم',
+                        'You get a notification every day')),
+                    value: reminderOn,
+                    activeThumbColor: primary,
+                    onChanged: _toggleReminder,
                   ),
-                  onTap: _pickTime,
-                ),
-                Divider(color: dividerColor(brightness)),
-                ListTile(
-                  contentPadding: EdgeInsets.zero,
-                  leading: const Icon(Icons.notifications_active),
-                  title: Text(t('إرسال إشعار تجريبي', 'Send a test notification')),
-                  trailing: const Icon(Icons.arrow_forward_ios, size: 14),
-                  onTap: _testNotification,
-                ),
-              ],
+                  Divider(color: dividerColor(brightness)),
+                  ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    leading: const Icon(Icons.alarm),
+                    title: Text(t('وقت التذكير', 'Reminder time')),
+                    trailing: Text(
+                      reminderTime.format(context),
+                      style: TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.bold,
+                          color: primary),
+                    ),
+                    onTap: _pickTime,
+                  ),
+                  Divider(color: dividerColor(brightness)),
+                  ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    leading: const Icon(Icons.notifications_active),
+                    title: Text(t('إرسال إشعار تجريبي',
+                        'Send a test notification')),
+                    trailing: const Icon(Icons.arrow_forward_ios, size: 14),
+                    onTap: _testNotification,
+                  ),
+                ],
+              ),
             ),
           ),
           const SizedBox(height: 16),
-          Container(
-            padding: const EdgeInsets.all(16),
-            decoration: BoxDecoration(
-              color: cardColor(brightness),
-              borderRadius: BorderRadius.circular(16),
-            ),
-            child: Column(
-              children: [
-                SwitchListTile(
-                  contentPadding: EdgeInsets.zero,
-                  title: Text(t('الوضع الليلي', 'Dark mode'),
-                      style: const TextStyle(
-                          fontSize: 18, fontWeight: FontWeight.bold)),
-                  subtitle: Text(t('التنقل بين الوضعين الليلي والنهاري',
-                      'Toggle between dark and light mode')),
-                  value: HabitFlowApp.of(context)?._darkMode ?? true,
-                  activeThumbColor: primary,
-                  onChanged: (v) => HabitFlowApp.of(context)?.setDarkMode(v),
-                ),
-              ],
+          Material(
+            color: cardColor(brightness),
+            borderRadius: BorderRadius.circular(16),
+            clipBehavior: Clip.antiAlias,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+              child: SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                title: Text(t('الوضع الليلي', 'Dark mode'),
+                    style: const TextStyle(
+                        fontSize: 18, fontWeight: FontWeight.bold)),
+                subtitle: Text(t('التنقل بين الوضعين الليلي والنهاري',
+                    'Toggle between dark and light mode')),
+                value: HabitFlowApp.of(context)?._darkMode ?? true,
+                activeThumbColor: primary,
+                onChanged: (v) => HabitFlowApp.of(context)?.setDarkMode(v),
+              ),
             ),
           ),
           const SizedBox(height: 16),
-          Container(
-            padding: const EdgeInsets.all(16),
-            decoration: BoxDecoration(
-              color: cardColor(brightness),
-              borderRadius: BorderRadius.circular(16),
-            ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(t('النسخ الاحتياطي', 'Backup & restore'),
-                    style:
-                        const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-                const SizedBox(height: 4),
-                ListTile(
-                  contentPadding: EdgeInsets.zero,
-                  leading: const Icon(Icons.upload_file),
-                  title: Text(t('تصدير نسخة', 'Export backup')),
-                  subtitle: Text(t('انسخ بياناتك إلى الحافظة',
-                      'Copy your data to the clipboard')),
-                  trailing: const Icon(Icons.arrow_forward_ios, size: 14),
-                  onTap: _exportBackup,
-                ),
-                Divider(color: dividerColor(brightness)),
-                ListTile(
-                  contentPadding: EdgeInsets.zero,
-                  leading: const Icon(Icons.download),
-                  title: Text(t('استعادة نسخة', 'Restore backup')),
-                  subtitle: Text(t('الصق بيانات النسخة الاحتياطية',
-                      'Paste your backup data')),
-                  trailing: const Icon(Icons.arrow_forward_ios, size: 14),
-                  onTap: _restoreBackup,
-                ),
-              ],
+          Material(
+            color: cardColor(brightness),
+            borderRadius: BorderRadius.circular(16),
+            clipBehavior: Clip.antiAlias,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(t('النسخ الاحتياطي', 'Backup & restore'),
+                      style:
+                          const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 4),
+                  ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    leading: const Icon(Icons.upload_file),
+                    title: Text(t('تصدير نسخة', 'Export backup')),
+                    subtitle: Text(t('نسخة كاملة بملف JSON 🗂️',
+                        'Full backup as a JSON file 🗂️')),
+                    trailing: const Icon(Icons.arrow_forward_ios, size: 14),
+                    onTap: _exportBackup,
+                  ),
+                  Divider(color: dividerColor(brightness)),
+                  ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    leading: const Icon(Icons.download),
+                    title: Text(t('استعادة نسخة', 'Restore backup')),
+                    subtitle: Text(t('ارفع ملف النسخة الاحتياطية 📂',
+                        'Pick your backup file 📂')),
+                    trailing: const Icon(Icons.arrow_forward_ios, size: 14),
+                    onTap: _restoreBackup,
+                  ),
+                ],
+              ),
             ),
           ),
           const SizedBox(height: 16),
@@ -5866,7 +8203,7 @@ class _SettingsPageState extends State<SettingsPage> {
                     style:
                         const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
                 const SizedBox(height: 8),
-                const Text('HabitFlow v1.2',
+                const Text('HabitFlow v1.0.3',
                     style: TextStyle(color: Colors.grey)),
                 const SizedBox(height: 4),
                 Text(t('تتبّع عاداتك وابنِ سلسلة نجاحك. 💪',
@@ -5876,42 +8213,372 @@ class _SettingsPageState extends State<SettingsPage> {
             ),
           ),
           const SizedBox(height: 16),
-          Container(
-            padding: const EdgeInsets.all(16),
-            decoration: BoxDecoration(
-              color: cardColor(brightness),
-              borderRadius: BorderRadius.circular(16),
-            ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  t('الحساب: ${AuthService.email ?? '-'}',
+          Material(
+            color: cardColor(brightness),
+            borderRadius: BorderRadius.circular(16),
+            clipBehavior: Clip.antiAlias,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    t('الحساب: ${AuthService.email ?? '-'}',
                       'Account: ${AuthService.email ?? '-'}'),
-                  style: const TextStyle(fontSize: 14),
-                ),
-                const SizedBox(height: 4),
-                ListTile(
+                    style: const TextStyle(fontSize: 14),
+                  ),
+                  const SizedBox(height: 4),
+                  ListTile(
                   contentPadding: EdgeInsets.zero,
                   leading: const Icon(Icons.logout, color: Colors.red),
                   title: Text(t('تسجيل الخروج', 'Log out'),
                       style: const TextStyle(color: Colors.red)),
                   onTap: () async {
-                    await AuthService.logout();
-                    if (context.mounted) {
-                      Navigator.pushAndRemoveUntil(
-                        context,
-                        MaterialPageRoute(builder: (_) => const RootPage()),
-                        (route) => false,
-                      );
-                    }
-                  },
-                ),
-              ],
+                      await AuthService.logout();
+                      if (context.mounted) {
+                        Navigator.pushAndRemoveUntil(
+                          context,
+                          MaterialPageRoute(builder: (_) => const RootPage()),
+                          (route) => false,
+                        );
+                      }
+                    },
+                  ),
+                ],
+              ),
             ),
           ),
         ],
       ),
+    );
+  }
+}
+
+
+class _ColorWheelDialog extends StatefulWidget {
+  const _ColorWheelDialog({required this.initial});
+
+  final Color initial;
+
+  @override
+  State<_ColorWheelDialog> createState() => _ColorWheelDialogState();
+}
+
+class _ColorWheelDialogState extends State<_ColorWheelDialog> {
+  static const double _wheelSize = 232;
+  late double _hue;
+  late double _sat;
+  late double _val;
+
+  @override
+  void initState() {
+    super.initState();
+    final hsv = HSVColor.fromColor(widget.initial);
+    _hue = hsv.hue;
+    _sat = hsv.saturation;
+    _val = hsv.value;
+  }
+
+  Color get _color => HSVColor.fromAHSV(1, _hue, _sat, _val).toColor();
+
+  void _updateFromLocal(Offset local) {
+    final maxR = _wheelSize / 2 - 10;
+    final dx = local.dx - _wheelSize / 2;
+    final dy = local.dy - _wheelSize / 2;
+    final r = sqrt(dx * dx + dy * dy);
+    var hue = atan2(dy, dx) * 180 / pi;
+    if (hue < 0) hue += 360;
+    setState(() {
+      _hue = hue;
+      _sat = (r / maxR).clamp(0.0, 1.0).toDouble();
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final brightness = Theme.of(context).brightness;
+    return AlertDialog(
+      backgroundColor: cardColor(brightness),
+      title: Row(
+        children: [
+          const Icon(Icons.colorize_rounded),
+          const SizedBox(width: 10),
+          Text(t('لون مخصص', 'Custom colour'),
+              style:
+                  const TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
+        ],
+      ),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            SizedBox(
+              width: _wheelSize,
+              height: _wheelSize,
+              child: GestureDetector(
+                onPanDown: (d) => _updateFromLocal(d.localPosition),
+                onPanUpdate: (d) => _updateFromLocal(d.localPosition),
+                child: CustomPaint(
+                  painter: _ColorWheelPainter(
+                    hue: _hue,
+                    sat: _sat,
+                    thumbColor: _color,
+                    edgeColor: brightness == Brightness.dark
+                        ? Colors.white
+                        : Colors.black,
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(height: 16),
+            Row(
+              children: [
+                Icon(Icons.brightness_6,
+                    size: 20, color: Colors.grey.shade500),
+                Expanded(
+                  child: Slider(
+                    value: _val,
+                    activeColor: _color,
+                    onChanged: (v) => setState(() => _val = v),
+                  ),
+                ),
+                Container(
+                  width: 36,
+                  height: 36,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: _color,
+                    border: Border.all(
+                        color: Colors.grey.withValues(alpha: 0.5)),
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: Text(t('إلغاء', 'Cancel')),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.pop(context, _color),
+          child: Text(t('حفظ التغييرات', 'Save changes')),
+        ),
+      ],
+    );
+  }
+}
+
+class _ColorWheelPainter extends CustomPainter {
+  _ColorWheelPainter({
+    required this.hue,
+    required this.sat,
+    required this.thumbColor,
+    required this.edgeColor,
+  });
+
+  final double hue;
+  final double sat;
+  final Color thumbColor;
+  final Color edgeColor;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final center = size.center(Offset.zero);
+    final radius = size.shortestSide / 2 - 10;
+    final rect = Rect.fromCircle(center: center, radius: radius);
+
+    const hueColors = [
+      Color(0xFFFF0000),
+      Color(0xFFFFFF00),
+      Color(0xFF00FF00),
+      Color(0xFF00FFFF),
+      Color(0xFF0000FF),
+      Color(0xFFFF00FF),
+      Color(0xFFFF0000),
+    ];
+    canvas.drawCircle(
+        center, radius, Paint()..shader = SweepGradient(colors: hueColors).createShader(rect));
+
+    final radial = RadialGradient(colors: [
+      Colors.white,
+      Colors.white.withValues(alpha: 0.0),
+    ]);
+    canvas.drawCircle(
+        center, radius, Paint()..shader = radial.createShader(rect));
+
+    final angle = hue * pi / 180;
+    final thumb = center + Offset(cos(angle), sin(angle)) * (sat * radius);
+    canvas.drawCircle(thumb, 12, Paint()..color = Colors.white);
+    canvas.drawCircle(
+        thumb,
+        12,
+        Paint()
+          ..color = edgeColor.withValues(alpha: 0.65)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 2);
+    canvas.drawCircle(thumb, 8.5, Paint()..color = thumbColor);
+  }
+
+  @override
+  bool shouldRepaint(covariant _ColorWheelPainter old) =>
+      old.hue != hue || old.sat != sat || old.thumbColor != thumbColor;
+}
+
+class _ProSection extends StatelessWidget {
+  const _ProSection({required this.title, required this.child});
+
+  final String title;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    if (AuthService.isProUser) return child;
+    final primary = Theme.of(context).colorScheme.primary;
+    final brightness = Theme.of(context).brightness;
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        color: cardColor(brightness),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: primary.withAlpha(70), width: 1.2),
+      ),
+      child: Column(
+        children: [
+          Container(
+            width: 58,
+            height: 58,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              gradient: LinearGradient(
+                colors: [
+                  primary,
+                  Theme.of(context).colorScheme.tertiary,
+                ],
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+              ),
+            ),
+            child: const Icon(Icons.lock_rounded,
+                color: Colors.white, size: 28),
+          ),
+          const SizedBox(height: 14),
+          Text(title,
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                  fontWeight: FontWeight.w800, fontSize: 16)),
+          const SizedBox(height: 6),
+          Text(t('متاح في برو 🔒', 'Available in Pro 🔒'),
+              textAlign: TextAlign.center,
+              style: TextStyle(color: Colors.grey.shade500, fontSize: 13)),
+          const SizedBox(height: 16),
+          FilledButton.icon(
+            onPressed: () => Navigator.push(context,
+                MaterialPageRoute(builder: (_) => const ProPage())),
+            icon: const Icon(Icons.workspace_premium, size: 18),
+            label: Text(t('رقّي إلى برو', 'Upgrade to Pro')),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _IconLibraryDialog extends StatefulWidget {
+  const _IconLibraryDialog({required this.selectedIndex});
+
+  final int selectedIndex;
+
+  @override
+  State<_IconLibraryDialog> createState() => _IconLibraryDialogState();
+}
+
+class _IconLibraryDialogState extends State<_IconLibraryDialog> {
+  late int _selected;
+
+  @override
+  void initState() {
+    super.initState();
+    _selected = widget.selectedIndex;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final icons = Habit.extraIcons;
+    final offset = Habit.basicIcons.length;
+    final primary = Theme.of(context).colorScheme.primary;
+    final brightness = Theme.of(context).brightness;
+
+    return AlertDialog(
+      backgroundColor: cardColor(brightness),
+      title: Row(
+        children: [
+          const Icon(Icons.apps_rounded),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(t('مكتبة الأيقونات', 'Icon library'),
+                style: const TextStyle(
+                    fontSize: 20, fontWeight: FontWeight.w800)),
+          ),
+        ],
+      ),
+      content: SizedBox(
+        width: 360,
+        height: 400,
+        child: GridView.builder(
+          gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+              crossAxisCount: 5,
+              mainAxisSpacing: 8,
+              crossAxisSpacing: 8),
+          itemCount: icons.length,
+          itemBuilder: (ctx, i) {
+            final idx = offset + i;
+            final sel = _selected == idx;
+            return GestureDetector(
+              onTap: () => setState(() => _selected = idx),
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 200),
+                decoration: BoxDecoration(
+                  color: sel ? null : secondaryColor(brightness),
+                  gradient: sel
+                      ? LinearGradient(
+                          colors: [
+                            primary,
+                            Theme.of(ctx).colorScheme.tertiary,
+                          ],
+                          begin: Alignment.topLeft,
+                          end: Alignment.bottomRight,
+                        )
+                      : null,
+                  borderRadius: BorderRadius.circular(12),
+                  border: sel
+                      ? Border.all(
+                          color: brightness == Brightness.dark
+                              ? Colors.white
+                              : Colors.black,
+                          width: 2)
+                      : null,
+                ),
+                child: Icon(icons[i],
+                    size: 24, color: sel ? Colors.white : primary),
+              ),
+            );
+          },
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: Text(t('إلغاء', 'Cancel')),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.pop(context, _selected),
+          child: Text(t('اختيار', 'Select')),
+        ),
+      ],
     );
   }
 }
