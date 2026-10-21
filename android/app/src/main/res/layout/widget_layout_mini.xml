@@ -1,0 +1,87 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<!-- HabitFlow - mini compact widget (smallest size) -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/widgetRoot"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@drawable/widget_bg"
+    android:orientation="vertical"
+    android:gravity="center_vertical"
+    android:padding="14dp"
+    android:layoutDirection="rtl">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <TextView
+            android:id="@+id/miniPercent"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="0%"
+            android:textColor="#9B6DFF"
+            android:textSize="24sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/miniStreak"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:drawablePadding="4dp"
+            android:text="🔥 0"
+            android:textColor="#FFA000"
+            android:textSize="13sp"
+            android:textStyle="bold" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:id="@+id/miniDots"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <ImageView
+            android:id="@+id/miniDot0"
+            android:layout_width="12dp"
+            android:layout_height="12dp"
+            android:layout_marginRight="9dp" />
+
+        <ImageView
+            android:id="@+id/miniDot1"
+            android:layout_width="12dp"
+            android:layout_height="12dp"
+            android:layout_marginRight="9dp" />
+
+        <ImageView
+            android:id="@+id/miniDot2"
+            android:layout_width="12dp"
+            android:layout_height="12dp"
+            android:layout_marginRight="9dp" />
+
+        <ImageView
+            android:id="@+id/miniDot3"
+            android:layout_width="12dp"
+            android:layout_height="12dp"
+            android:layout_marginRight="9dp" />
+
+        <ImageView
+            android:id="@+id/miniDot4"
+            android:layout_width="12dp"
+            android:layout_height="12dp" />
+
+        <TextView
+            android:id="@+id/miniHint"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginRight="8dp"
+            android:text="✨"
+            android:textColor="#9AA0A6"
+            android:textSize="13sp"
+            android:visibility="gone" />
+    </LinearLayout>
+</LinearLayout>
