@@ -250,7 +250,7 @@ object WidgetUi {
         v.setTextViewText(R.id.w_sub, WidgetData.t(context, "رقِّ إلى برو لفتح هذا الويدجت", "Upgrade to Pro to unlock this widget"))
         v.setInt(R.id.w_cta, "setBackgroundResource", th.chipOnRes)
         v.setTextColor(R.id.w_cta, th.onAccent)
-        v.setTextViewText(R.id.w_cta, WidgetData.t(context, "رقِّ إلى برو", "Upgrade to Pro"))
+        v.setTextViewText(R.id.w_cta, WidgetData.t(context, "رقِّ", "Upgrade"))
         v.setOnClickPendingIntent(R.id.w_root, openApp(context, "pro"))
         return v
     }

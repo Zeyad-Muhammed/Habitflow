@@ -242,7 +242,10 @@ class HeatmapWidget : BaseWidget() {
         v.setTextColor(R.id.w_title, th.text)
         v.setTextViewText(
             R.id.w_meta,
-            WidgetData.t(context, "${WidgetData.daysLabel(context, active)} نشاط", "$active active days")
+            WidgetData.t(
+                context, "${WidgetData.daysLabel(context, active)} نشاط",
+                if (active == 1) "1 active day" else "$active active days"
+            )
         )
         v.setTextColor(R.id.w_meta, th.accent)
         val bmp = WidgetUi.heatmapBitmap(
