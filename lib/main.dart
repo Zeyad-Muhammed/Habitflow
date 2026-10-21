@@ -1,4 +1,4 @@
-﻿import 'dart:async';
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
@@ -47,6 +47,29 @@ class Language {
 }
 
 String t(String ar, String en) => Language.isAr ? ar : en;
+
+/// Left-to-right isolate: keeps numbers/Latin runs like "45 / 150 XP" in
+/// their natural order inside Arabic (RTL) sentences.
+String ltr(String s) => '\u2066$s\u2069';
+
+/// First-strong isolate for user text (habit names) embedded in a sentence,
+/// so a Latin name inside quotes does not scramble the surrounding Arabic.
+String iso(String s) => '\u2068$s\u2069';
+
+/// Arabic day count with the right plural form: 1 يوم, 2 يومين,
+/// 3–10 أيام, 11+ يوم.
+String daysAr(int n) {
+  if (n == 2) return 'يومين';
+  if (n >= 3 && n <= 10) return '$n أيام';
+  return '$n يوم';
+}
+
+/// "N day(s)" in the current language.
+String daysLabel(int n) => t(daysAr(n), n == 1 ? '$n day' : '$n days');
+
+/// Calendar-safe day arithmetic. Adding Duration(days: n) breaks across DST
+/// changes (e.g. Africa/Cairo in late October) and can repeat or skip a date.
+DateTime addDays(DateTime d, int n) => DateTime(d.year, d.month, d.day + n);
 
 class AuthService {
   static const _salt = 'habitflow_salt_v1';
@@ -512,6 +535,11 @@ InputDecoration softInputDecoration(
   );
 }
 
+/// Transparent status bar with icons that contrast with the app background.
+SystemUiOverlayStyle overlayStyleFor(bool isDark) =>
+    (isDark ? SystemUiOverlayStyle.light : SystemUiOverlayStyle.dark)
+        .copyWith(statusBarColor: Colors.transparent);
+
 ThemeData _buildTheme(Color seed, Brightness b) {
   final isDark = b == Brightness.dark;
   final scheme = ColorScheme.fromSeed(
@@ -534,6 +562,9 @@ ThemeData _buildTheme(Color seed, Brightness b) {
     ),
     appBarTheme: AppBarTheme(
       backgroundColor: Colors.transparent,
+      // Transparent app bars cannot infer the status bar icon colour.
+      systemOverlayStyle:
+          overlayStyleFor(isDark),
       elevation: 0,
       scrolledUnderElevation: 0,
       centerTitle: false,
@@ -758,10 +789,16 @@ class HabitFlowAppState extends State<HabitFlowApp> {
       themeMode: _darkMode ? ThemeMode.dark : ThemeMode.light,
       builder: (context, child) {
         final cs = Theme.of(context).colorScheme;
-        return _AmbientBackground(
-          scheme: cs,
-          isDark: Theme.of(context).brightness == Brightness.dark,
-          child: child ?? const SizedBox.shrink(),
+        final isDark = Theme.of(context).brightness == Brightness.dark;
+        // Screens without an AppBar (home, onboarding, sign-in) need the
+        // status bar icon colour set here, or they stay white in light mode.
+        return AnnotatedRegion<SystemUiOverlayStyle>(
+          value: overlayStyleFor(isDark),
+          child: _AmbientBackground(
+            scheme: cs,
+            isDark: isDark,
+            child: child ?? const SizedBox.shrink(),
+          ),
         );
       },
       home: KeyedSubtree(
@@ -1055,7 +1092,7 @@ class _OnboardingPageState extends State<OnboardingPage> {
         child: Column(
           children: [
             Align(
-              alignment: Alignment.centerRight,
+              alignment: AlignmentDirectional.centerEnd,
               child: TextButton(
                 onPressed: _done,
                 child: Text(t('تخطّي', 'Skip')),
@@ -1213,8 +1250,8 @@ class _AuthPageState extends State<AuthPage> {
     final passText = _password.text;
     if (emailText.isEmpty || passText.length < 4) {
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text(t('أدخل بريدك وكلمة مرور (٦ حروف فأكثر)',
-              'Enter your email and a password (6+ characters)'))));
+          content: Text(t('أدخل بريدك وكلمة مرور (4 حروف فأكثر)',
+              'Enter your email and a password (4+ characters)'))));
       return;
     }
     setState(() => _loading = true);
@@ -1527,7 +1564,7 @@ context,
                   ),
                 ),
                 const SizedBox(height: 4),
-                Text('HabitFlow v1.2',
+                Text('HabitFlow v1.0.3',
                     style: TextStyle(color: Colors.grey.shade700, fontSize: 12)),
               ],
             ),
@@ -1659,7 +1696,7 @@ class _ResetPasswordPageState extends State<ResetPasswordPage> {
   Future<void> _saveNewPassword() async {
     final pass = _newPass.text;
     if (pass.length < 4) {
-      _toast(t('الباسورد لازم ٤ حروف فأكثر', 'Password must be 4+ characters'));
+      _toast(t('الباسورد لازم 4 حروف فأكثر', 'Password must be 4+ characters'));
       return;
     }
     if (pass != _confirm.text) {
@@ -1702,7 +1739,9 @@ class _ResetPasswordPageState extends State<ResetPasswordPage> {
             child: Column(
               children: [
                 Image.asset(
-                  'assets/icon/logo_white.png',
+                  brightness == Brightness.dark
+                      ? 'assets/icon/logo_white.png'
+                      : 'assets/icon/logo_black.png',
                   height: 72,
                 ),
                 const SizedBox(height: 20),
@@ -1760,7 +1799,7 @@ class _ResetPasswordPageState extends State<ResetPasswordPage> {
                               letterSpacing: 6),
                           decoration: softInputDecoration(
                             context,
-                            label: t('كود من ٦ أرقام', '6-digit code'),
+                            label: t('كود من 6 أرقام', '6-digit code'),
                             prefix: const Icon(Icons.pin_outlined),
                           ),
                         ),
@@ -2180,7 +2219,7 @@ class Habit {
 
   int daysDoneInRange(DateTime from, DateTime to) {
     var count = 0;
-    for (var d = from; !d.isAfter(to); d = d.add(const Duration(days: 1))) {
+    for (var d = from; !d.isAfter(to); d = addDays(d, 1)) {
       if (isDoneOn(d)) count++;
     }
     return count;
@@ -2202,7 +2241,7 @@ class Habit {
 
   static DateTime mondayOf(DateTime d) {
     final diff = (d.weekday - DateTime.monday) % 7;
-    return DateTime(d.year, d.month, d.day).subtract(Duration(days: diff));
+    return addDays(d, -diff);
   }
 
   int currentStreak() {
@@ -2210,16 +2249,16 @@ class Habit {
     int streak = 0;
     var day = DateTime.now();
     if (!isDueOn(day)) {
-      day = day.subtract(const Duration(days: 1));
+      day = addDays(day, -1);
     }
     while (true) {
       if (!isDueOn(day)) {
-        day = day.subtract(const Duration(days: 1));
+        day = addDays(day, -1);
         continue;
       }
       if (isDoneOn(day)) {
         streak++;
-        day = day.subtract(const Duration(days: 1));
+        day = addDays(day, -1);
       } else {
         break;
       }
@@ -2234,11 +2273,11 @@ class Habit {
     if (self.daysDoneInRange(mondayOf(today), today) >= timesPerWeek) {
       streak++;
     }
-    var weekStart = mondayOf(today).subtract(const Duration(days: 7));
+    var weekStart = addDays(mondayOf(today), -7);
     while (self.daysDoneInRange(weekStart,
-            weekStart.add(const Duration(days: 6))) >= timesPerWeek) {
+            addDays(weekStart, 6)) >= timesPerWeek) {
       streak++;
-      weekStart = weekStart.subtract(const Duration(days: 7));
+      weekStart = addDays(weekStart, -7);
     }
     return streak;
   }
@@ -2249,8 +2288,8 @@ class Habit {
       var weekStart = mondayOf(DateTime.now());
       for (var ws = mondayOf(_earliest());
           !ws.isAfter(weekStart);
-          ws = ws.add(const Duration(days: 7))) {
-        if (daysDoneInRange(ws, ws.add(const Duration(days: 6))) >=
+          ws = addDays(ws, 7)) {
+        if (daysDoneInRange(ws, addDays(ws, 6)) >=
             timesPerWeek) {
           best++;
         } else if (best > 0) {
@@ -2263,7 +2302,7 @@ class Habit {
     int run = 0;
     for (var d = _earliest();
         !d.isAfter(DateTime.now());
-        d = d.add(const Duration(days: 1))) {
+        d = addDays(d, 1)) {
       if (!isDueOn(d)) continue;
       if (isDoneOn(d)) {
         run++;
@@ -2277,10 +2316,10 @@ class Habit {
 
   /// الحلقة الهادئة: فقدت يوم مستحق قبل هذا اليوم ثم عدت اليوم.
   DateTime? _previousDueBefore(DateTime day) {
-    var prev = day.subtract(const Duration(days: 1));
-    while (!prev.isBefore(_earliest().subtract(const Duration(days: 1)))) {
+    var prev = addDays(day, -1);
+    while (!prev.isBefore(addDays(_earliest(), -1))) {
       if (isDueOn(prev)) return prev;
-      prev = prev.subtract(const Duration(days: 1));
+      prev = addDays(prev, -1);
     }
     return null;
   }
@@ -2291,7 +2330,7 @@ class Habit {
     if (prev == null) return false;
     if (isDoneOn(prev)) return false;
     var wasActiveBefore = false;
-    for (var d = _earliest(); !d.isAfter(prev); d = d.add(const Duration(days: 1))) {
+    for (var d = _earliest(); !d.isAfter(prev); d = addDays(d, 1)) {
       if (isDueOn(d) && isDoneOn(d)) {
         wasActiveBefore = true;
         break;
@@ -2340,7 +2379,7 @@ class Habit {
     int run = 0;
     for (var d = _earliest();
         !d.isAfter(DateTime.now());
-        d = d.add(const Duration(days: 1))) {
+        d = addDays(d, 1)) {
       if (!isDueOn(d)) continue;
       if (isDoneOn(d)) {
         run++;
@@ -2359,7 +2398,7 @@ class Habit {
     int done = 0;
     int due = 0;
     for (int i = 0; i < n; i++) {
-      final d = DateTime.now().subtract(Duration(days: i));
+      final d = addDays(DateTime.now(), -i);
       if (!isDueOn(d)) continue;
       due++;
       if (isDoneOn(d)) done++;
@@ -2503,7 +2542,7 @@ Map<int, double> weekdayConsistency(List<Habit> habits, int weeks) {
   final total = {for (var w = 1; w <= 7; w++) w: 0};
   final today = DateTime.now();
   for (int i = 0; i < weeks * 7; i++) {
-    final d = today.subtract(Duration(days: i));
+    final d = addDays(today, -i);
     total[d.weekday] = total[d.weekday]! + habits.where((h) => h.isDueOn(d)).length;
     done[d.weekday] =
         done[d.weekday]! + habits.where((h) => h.isDoneOn(d)).length;
@@ -2607,7 +2646,7 @@ List<String> buildInsights(List<Habit> habits) {
 
   final hot = habits.where((h) => h.currentStreak() >= 7).toList();
   if (hot.isNotEmpty) {
-    out.add(t('🔥 ${hot.length} عادة بسلسلة نشطة ${hot.first.currentStreak()}+ يوم.',
+    out.add(t('🔥 ${hot.length} عادة بسلسلة نشطة ${ltr('${hot.first.currentStreak()}+')} يوم.',
         '🔥 ${hot.length} habit(s) with an active ${hot.first.currentStreak()}+ day streak.'));
   }
 
@@ -2620,7 +2659,7 @@ List<String> buildInsights(List<Habit> habits) {
           ? (h.target * 1.5).roundToDouble()
           : (h.target + h.target * 0.25).roundToDouble();
       out.add(t(
-          '📈 تتقن "${h.name}" — جرّب رفع الهدف إلى $suggested ${h.unit.trim()} للارتقاء بمستواك.',
+          '📈 تتقن "${iso(h.name)}" — جرّب رفع الهدف إلى ${ltr('$suggested')} ${h.unit.trim()} للارتقاء بمستواك.',
           '📈 You master "${h.name}" — try raising the goal to $suggested ${h.unit.trim()} to level up.'));
       break;
     }
@@ -2629,7 +2668,7 @@ List<String> buildInsights(List<Habit> habits) {
   final down = habits.where((h) => h.isDueOn(today) &&
       h.rateLastN(7) < 40 && h.countCompletions() >= 10).toList();
   if (down.isNotEmpty) {
-    out.add(t('⚠️ "${down.first.name}" هادئة هذا الأسبوع — اهتم بأفضل عاداتك أولاً.',
+    out.add(t('⚠️ "${iso(down.first.name)}" هادئة هذا الأسبوع — اهتم بأفضل عاداتك أولاً.',
         '⚠️ "${down.first.name}" is quiet this week — focus on your best habits first.'));
   }
 
@@ -2674,7 +2713,7 @@ class MoodSystem {
     final p = await SharedPreferences.getInstance();
     var streak = 0;
     for (var i = 0; i < 60; i++) {
-      final d = DateTime.now().subtract(Duration(days: i));
+      final d = addDays(DateTime.now(), -i);
       final m = p.getInt(_moodKey(AuthService.email, dayKey(d)));
       if (m == null || m < 4) break;
       streak++;
@@ -2686,7 +2725,7 @@ class MoodSystem {
     final p = await SharedPreferences.getInstance();
     final out = <String, int>{};
     for (var i = 0; i < 14; i++) {
-      final d = dayKey(DateTime.now().subtract(Duration(days: i)));
+      final d = dayKey(addDays(DateTime.now(), -i));
       final m = p.getInt(_moodKey(AuthService.email, d));
       if (m != null) out[d] = m;
     }
@@ -2712,40 +2751,40 @@ class BadgeSystem {
         t('أنشئ أول عادة لك', 'Create your first habit'),
         (h, l, x) => h.isNotEmpty),
     Badge('fire7', Icons.local_fire_department, t('على نار', 'On Fire'),
-        t('حقق سلسلة ٧ أيام', 'Reach a 7-day streak'),
+        t('حقق سلسلة 7 أيام', 'Reach a 7-day streak'),
         (h, l, x) => h.any((hb) => hb.longestStreak() >= 7)),
     Badge('bolt30', Icons.bolt, t('لا يُوقف', 'Unstoppable'),
-        t('حقق سلسلة ٣٠ يوماً', 'Reach a 30-day streak'),
+        t('حقق سلسلة 30 يوماً', 'Reach a 30-day streak'),
         (h, l, x) => h.any((hb) => hb.longestStreak() >= 30)),
     Badge('century', Icons.star, t('مئة إنجاز', 'Century'),
-        t('أنجز ١٠٠ عادة إجمالاً', 'Complete 100 habits in total'),
+        t('أنجز 100 عادة إجمالاً', 'Complete 100 habits in total'),
         (h, l, x) => h.fold<int>(0, (s, hb) => s + hb.countCompletions()) >= 100),
     Badge('perfectday', Icons.today, t('يوم مثالي', 'Perfect Day'),
         t('أنجز كل عاداتك في يوم واحد', 'Complete every habit in one day'),
         (h, l, x) => _perfectDayEver(h)),
     Badge('perfectweek', Icons.workspace_premium, t('أسبوع مثالي', 'Perfect Week'),
-        t('أنهي كل عاداتك ٧ أيام متتالية', 'Complete all habits 7 days in a row'),
+        t('أنهي كل عاداتك 7 أيام متتالية', 'Complete all habits 7 days in a row'),
         (h, l, x) => _perfectWeekEver(h)),
     Badge('level5', Icons.auto_awesome, t('نجم صاعد', 'Rising Star'),
-        t('صل للمستوى ٥', 'Reach level 5'),
+        t('صل للمستوى 5', 'Reach level 5'),
         (h, l, x) => l >= 5),
     Badge('level10', Icons.military_tech, t('سيد العادات', 'Habit Master'),
-        t('صل للمستوى ١٠', 'Reach level 10'),
+        t('صل للمستوى 10', 'Reach level 10'),
         (h, l, x) => l >= 10),
     Badge('measured', Icons.straighten, t('قابل للقياس', 'Measurable'),
         t('أنجز عادة قابلة للقياس', 'Complete a measurable habit'),
         (h, l, x) => h.any((hb) => hb.isMeasurable && hb.countCompletions() > 0)),
     Badge('consistent', Icons.rule, t('ثابت', 'Consistent'),
-        t('نجاح ٨٠٪+ خلال ٣٠ يوماً', '80%+ success over 30 days'),
+        t('نجاح 80%+ خلال 30 يوماً', '80%+ success over 30 days'),
         (h, l, x) => h.any((hb) => hb.countCompletions() > 0 && hb.rateLastN(30) >= 80)),
     Badge('clean7', Icons.eco, t('سلسلة نقية', 'Clean Streak'),
-        t('٧ أيام نقية على عادة إقلاع', '7 clean days on a quit habit'),
+        t('7 أيام نقية على عادة إقلاع', '7 clean days on a quit habit'),
         (h, l, x) => h.where((hb) => hb.isQuit).fold<int>(0, (m, hb) => m > hb.longestStreak() ? m : hb.longestStreak()) >= 7),
     Badge('scholar', Icons.school, t('عالِم', 'Scholar'),
-        t('أنجز ١٠ أهداف قابلة للقياس', 'Complete 10 measurable goals'),
+        t('أنجز 10 أهداف قابلة للقياس', 'Complete 10 measurable goals'),
         (h, l, x) => h.fold<int>(0, (s, hb) => s + (hb.isMeasurable ? hb.countCompletions() : 0)) >= 10),
-    Badge('runner', Icons.flag, t('نادي ١٠٠', '100 Club'),
-        t('أنجز ١٠٠ تسجيلاً هذا الأسبوع', 'Complete 100 logs this week'),
+    Badge('runner', Icons.flag, t('نادي 100', '100 Club'),
+        t('أنجز 100 تسجيلاً هذا الأسبوع', 'Complete 100 logs this week'),
         (h, l, x) => _hundredWeek(h)),
     Badge('focus', Icons.filter_center_focus, t('تركيز كامل', 'Full Focus'),
         t('أنجز أسبوعاً مثالياً في عادة واحدة', 'Complete a perfect week on one habit'),
@@ -2806,10 +2845,10 @@ class BadgeSystem {
   static bool _perfectWeekEver(List<Habit> habits) {
     if (habits.length < 2) return false;
     for (var offset = 0; offset < 60; offset++) {
-      final start = DateTime.now().subtract(Duration(days: 7 + offset));
+      final start = addDays(DateTime.now(), -(7 + offset));
       var ok = true;
       for (var i = 0; i < 7; i++) {
-        final day = start.add(Duration(days: i));
+        final day = addDays(start, i);
         if (habits.where((h) => h.isDoneOn(day)).length != habits.length) {
           ok = false;
           break;
@@ -2821,7 +2860,7 @@ class BadgeSystem {
   }
 
   static bool _hundredWeek(List<Habit> habits) =>
-      habits.fold<int>(0, (s, h) => s + h.daysDoneInRange(DateTime.now().subtract(const Duration(days: 6)), DateTime.now())) >= 100;
+      habits.fold<int>(0, (s, h) => s + h.daysDoneInRange(addDays(DateTime.now(), -6), DateTime.now())) >= 100;
 
   static bool _singlePerfectWeek(List<Habit> habits) {
     if (habits.isEmpty) return false;
@@ -2914,11 +2953,11 @@ const starterPacks = [
     icon: Icons.eco,
     color: Color(0xFF2EBD85),
     habits: [
-      PackHabit(nameAr: 'اشرب ماية ٨ أكواب 💧', nameEn: 'Drink 8 glasses of water',
+      PackHabit(nameAr: 'اشرب ماية 8 أكواب 💧', nameEn: 'Drink 8 glasses of water',
         iconIndex: 2, target: 8, unit: 'كوب'),
       PackHabit(nameAr: 'مشي يومي 🚶', nameEn: 'Daily walk', iconIndex: 6),
-      PackHabit(nameAr: 'النوم قبل ١١ 🛌', nameEn: 'Sleep by 11', iconIndex: 4),
-      PackHabit(nameAr: 'رياضة ٣ مرات/أسبوع 🏋️', nameEn: 'Workout 3×/week',
+      PackHabit(nameAr: 'النوم قبل 11 🛌', nameEn: 'Sleep by 11', iconIndex: 4),
+      PackHabit(nameAr: 'رياضة 3 مرات/أسبوع 🏋️', nameEn: 'Workout 3×/week',
         iconIndex: 0, frequency: 2, timesPerWeek: 3),
     ],
   ),
@@ -2928,11 +2967,11 @@ const starterPacks = [
     icon: Icons.menu_book,
     color: Color(0xFF4C7CFF),
     habits: [
-      PackHabit(nameAr: 'اقرأ ١٠ صفحات 📖', nameEn: 'Read 10 pages',
+      PackHabit(nameAr: 'اقرأ 10 صفحات 📖', nameEn: 'Read 10 pages',
         iconIndex: 1, target: 10, unit: 'صفحة'),
-      PackHabit(nameAr: '٥ دقايق إنجليزي 🇬🇧', nameEn: '5 min language practice',
+      PackHabit(nameAr: '5 دقايق إنجليزي 🇬🇧', nameEn: '5 min language practice',
         iconIndex: 3, target: 5, unit: 'دقيقة'),
-      PackHabit(nameAr: 'مذاكرة ٢٥ دقيقة 🎯', nameEn: '25 min deep work',
+      PackHabit(nameAr: 'مذاكرة 25 دقيقة 🎯', nameEn: '25 min deep work',
         iconIndex: 5, target: 25, unit: 'دقيقة'),
       PackHabit(nameAr: 'مذكرات يومية ✍️', nameEn: 'Daily journal', iconIndex: 8),
     ],
@@ -2943,10 +2982,10 @@ const starterPacks = [
     icon: Icons.fitness_center,
     color: Color(0xFFFF8A3D),
     habits: [
-      PackHabit(nameAr: 'تمرين ٣ مرات/أسبوع 🏋️', nameEn: 'Workout 3×/week',
+      PackHabit(nameAr: 'تمرين 3 مرات/أسبوع 🏋️', nameEn: 'Workout 3×/week',
         iconIndex: 0, frequency: 2, timesPerWeek: 3),
       PackHabit(nameAr: 'إطالة يومية 🤸', nameEn: 'Daily stretching', iconIndex: 3),
-      PackHabit(nameAr: '١٠ آلاف خطوة 👟', nameEn: '10k steps',
+      PackHabit(nameAr: '10 آلاف خطوة 👟', nameEn: '10k steps',
         iconIndex: 6, target: 10000, unit: 'خطوة'),
       PackHabit(nameAr: 'أكواب ميادة 💧', nameEn: 'Drink water',
         iconIndex: 2, target: 8, unit: 'كوب'),
@@ -2988,7 +3027,7 @@ class ChallengeSystem {
       case 1:
         return measurable.isNotEmpty
             ? (id: 'measurable', title: t('حقّق هدفك 🎯', 'Hit your goal 🎯'),
-                desc: t('صل لهدفك في "${measurable.first.name}" اليوم.',
+                desc: t('صل لهدفك في "${iso(measurable.first.name)}" اليوم.',
                     'Hit your "${measurable.first.name}" goal today.'),
                 target: 1, xp: 60)
             : (id: 'kill_it', title: t('أنهِ كل شيء اليوم ⚡', 'Finish everything today ⚡'),
@@ -3002,7 +3041,7 @@ class ChallengeSystem {
             target: 2, xp: 50);
       case 3:
         return (id: 'noon', title: t('قبل الظهر ☀️', 'Before noon ☀️'),
-            desc: t('أنجز عادة قبل الساعة ١٢:٠٠.',
+            desc: t('أنجز عادة قبل الساعة 12:00.',
                 'Complete a habit before 12:00.'),
             target: 1, xp: 45);
       case 4:
@@ -3012,7 +3051,7 @@ class ChallengeSystem {
             target: 1, xp: 40);
       case 5:
         return (id: 'earlybird', title: t('طائر مبكر 🐦', 'Early bird 🐦'),
-            desc: t('أنجز عادة قبل الساعة ١٠:٠٠.',
+            desc: t('أنجز عادة قبل الساعة 10:00.',
                 'Complete a habit before 10:00.'),
             target: 1, xp: 45);
       default:
@@ -3154,9 +3193,10 @@ class _HomePageState extends State<HomePage> {
   void initState() {
     super.initState();
     HomePage.reload = _loadHabits;
-    _loadHabits();
+    // Extras (daily challenge, insights) depend on the habit list, so build
+    // them only after the habits are loaded.
+    _loadHabits().then((_) => _loadExtras());
     _refreshXp();
-    _loadExtras();
     NotificationService.init();
   }
 
@@ -3202,6 +3242,7 @@ class _HomePageState extends State<HomePage> {
         'habits', jsonEncode(habits.map((h) => h.toMap()).toList()));
     refreshWidget();
     widget.onStatsChanged?.call(habits);
+    _loadExtras();
   }
 
   void _deleteHabit(int index) {
@@ -3218,7 +3259,7 @@ class _HomePageState extends State<HomePage> {
           backgroundColor: cardColor(Theme.of(context).brightness),
           title: Text(t('وصلت لحد الإصدار المجاني 🚧', 'You hit the free limit 🚧')),
           content: Text(t(
-              'النسخة المجانية تسمح حتى ٣ عادات.\n\nرقّي إلى برو لعادات غير محدودة وبلا إعلانات والمزيد.',
+              'النسخة المجانية تسمح حتى 3 عادات.\n\nرقّي إلى برو لعادات غير محدودة وبلا إعلانات والمزيد.',
               'The free version allows up to 3 habits.\n\nUpgrade to Pro for unlimited habits, no ads and more.')),
           actions: [
             TextButton(
@@ -3278,7 +3319,7 @@ class _HomePageState extends State<HomePage> {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(t(
-                '💛 عودة! رجعت لـ"${habit.name}" — ودي تُحسب كإنجاز.',
+                '💛 عودة! رجعت لـ"${iso(habit.name)}" — ودي تُحسب كإنجاز.',
                 '💛 Comeback! You came back to "${habit.name}" — counted as a win.')),
             behavior: SnackBarBehavior.floating,
             duration: const Duration(milliseconds: 1800),
@@ -3311,7 +3352,7 @@ class _HomePageState extends State<HomePage> {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text(t('أنجزت "${habit.name}" اليوم بالفعل ✅',
+            content: Text(t('أنجزت "${iso(habit.name)}" اليوم بالفعل ✅',
                 'Already completed "${habit.name}" today ✅')),
             behavior: SnackBarBehavior.floating,
           ),
@@ -3349,12 +3390,12 @@ class _HomePageState extends State<HomePage> {
       context: context,
       builder: (ctx) => AlertDialog(
         backgroundColor: cardColor(Theme.of(context).brightness),
-        title: Text(t('سجّل "${habit.name}"', 'Log "${habit.name}"')),
+        title: Text(t('سجّل "${iso(habit.name)}"', 'Log "${habit.name}"')),
         content: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
             Text(t(
-                'اليوم: ${_fmt(recorded)} / ${_fmt(habit.target)}${habit.unit.isEmpty ? '' : ' ${habit.unit}'}',
+                'اليوم: ${ltr('${_fmt(recorded)} / ${_fmt(habit.target)}')}${habit.unit.isEmpty ? '' : ' ${habit.unit}'}',
                 'Today: ${_fmt(recorded)} / ${_fmt(habit.target)}${habit.unit.isEmpty ? '' : ' ${habit.unit}'}')),
             const SizedBox(height: 12),
             TextField(
@@ -3379,7 +3420,7 @@ class _HomePageState extends State<HomePage> {
               children: [
                 for (final q in [1.0, 2.0, 5.0, 10.0])
                   ActionChip(
-                    label: Text('+${_fmt(q)}'),
+                    label: Text(ltr('+${_fmt(q)}')),
                     onPressed: () => Navigator.pop(ctx, q),
                   ),
               ],
@@ -3461,8 +3502,8 @@ class _HomePageState extends State<HomePage> {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(bonus > 0
-              ? t('🔥 سلسلة $streak يوم! +${10 + bonus} XP',
-                  '🔥 $streak-${streak == 1 ? 'day' : 'day'} streak! +${10 + bonus} XP')
+              ? t('🔥 سلسلة ${daysAr(streak)}! ${ltr('+${10 + bonus} XP')}',
+                  '🔥 $streak-day streak! +${10 + bonus} XP')
               : '+10 XP ⚡'),
           duration: const Duration(milliseconds: 1500),
           behavior: SnackBarBehavior.floating,
@@ -3478,7 +3519,7 @@ class _HomePageState extends State<HomePage> {
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text(mood >= 4
-            ? t('أجواء رائعة اليوم +5 XP ✨', 'Great mood today +5 XP ✨')
+            ? t('أجواء رائعة اليوم ${ltr('+5 XP')} ✨', 'Great mood today +5 XP ✨')
             : t('شكراً لتفاعلك معنا 💛', 'Thanks for sharing 💛')),
         behavior: SnackBarBehavior.floating,
         duration: const Duration(milliseconds: 1200),
@@ -3508,12 +3549,13 @@ class _HomePageState extends State<HomePage> {
     final challenge = ChallengeSystem.today(habits);
     final res = await ChallengeSystem.maybeComplete(
         habits, challenge.id, challenge.target);
+    if (res.done) await _loadExtras();
     if (!mounted) return;
     if (newly.isNotEmpty) _showBadgeUnlocked(newly);
     if (res.done && res.xp > 0) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text(t('🎯 اكتمل التحدي اليومي! +${res.xp} XP',
+          content: Text(t('🎯 اكتمل التحدي اليومي! ${ltr('+${res.xp} XP')}',
             '🎯 Daily challenge completed! +${res.xp} XP')),
           behavior: SnackBarBehavior.floating,
           duration: const Duration(milliseconds: 1800),
@@ -3549,7 +3591,7 @@ class _HomePageState extends State<HomePage> {
                 const SizedBox(height: 16),
                 FilledButton(
                   onPressed: () => Navigator.pop(ctx),
-                  child: Text(t('رائع +25 XP', 'Awesome +25 XP')),
+                  child: Text(t('رائع ${ltr('+25 XP')}', 'Awesome +25 XP')),
                 ),
               ],
             ),
@@ -3591,7 +3633,7 @@ class _HomePageState extends State<HomePage> {
                         borderRadius: BorderRadius.circular(4),
                       ),
                       const SizedBox(height: 6),
-                      Text(t('$xpIn / $need XP حتى المستوى التالي',
+                      Text(t('${ltr('$xpIn / $need XP')} حتى المستوى التالي',
                           '$xpIn / $need XP to the next level'),
                           style: TextStyle(
                               color: Colors.grey.shade500, fontSize: 12)),
@@ -3668,13 +3710,15 @@ child: Text(t('رائع!', 'Awesome!')),
     final greeting = now.hour < 12
         ? t('صباح الخير', 'Good morning')
         : now.hour < 18
-            ? t('مساء الخير', 'Good evening')
+            ? t('مساء الخير', 'Good afternoon')
             : t('مساء الخير', 'Good evening');
 
     return Scaffold(
       body: SafeArea(
         child: ListView(
-          padding: const EdgeInsets.all(20),
+          // Extra bottom space so the floating + button never covers the
+          // last habit card.
+          padding: const EdgeInsets.fromLTRB(20, 20, 20, 104),
           children: [
             Row(
               children: [
@@ -3690,7 +3734,7 @@ child: Text(t('رائع!', 'Awesome!')),
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                          '$greeting, ${AuthService.name ?? t('صديقي', 'friend')} 👋',
+                          '$greeting${t('،', ',')} ${iso(AuthService.name ?? t('صديقي', 'friend'))} 👋',
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                           style: TextStyle(
@@ -3862,7 +3906,7 @@ child: Text(t('رائع!', 'Awesome!')),
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Text(t('المستوى $_level — إجمالي $_xp XP',
+                          Text(t('المستوى $_level — إجمالي ${ltr('$_xp XP')}',
         'Level $_level — $_xp total XP'),
     style: const TextStyle(
         fontWeight: FontWeight.bold, fontSize: 14)),
@@ -3880,7 +3924,7 @@ child: Text(t('رائع!', 'Awesome!')),
                           ),
                           const SizedBox(height: 4),
                           Text(
-                            t('${XpSystem.xpInLevel(_xp)} / ${XpSystem.xpToNextLevel(_xp)} XP حتى المستوى التالي',
+                            t('${ltr('${XpSystem.xpInLevel(_xp)} / ${XpSystem.xpToNextLevel(_xp)} XP')} حتى المستوى التالي',
                                 '${XpSystem.xpInLevel(_xp)} / ${XpSystem.xpToNextLevel(_xp)} XP to next level'),
                             style: TextStyle(
                                 color: Colors.grey.shade500, fontSize: 11),
@@ -3944,10 +3988,13 @@ if (_challengeClaimed)
                                 child: ClipRRect(
                                   borderRadius: BorderRadius.circular(4),
                                   child: LinearProgressIndicator(
-                                    value: _challenge!.target == 0
-                                        ? 0
-                                        : (_challengeProg / _challenge!.target)
-                                            .clamp(0.0, 1.0),
+                                    value: _challengeClaimed
+                                        ? 1
+                                        : _challenge!.target == 0
+                                            ? 0
+                                            : (_challengeProg /
+                                                    _challenge!.target)
+                                                .clamp(0.0, 1.0),
                                     minHeight: 8,
                                     backgroundColor: secondaryColor(brightness),
                                     color: primary,
@@ -3955,7 +4002,12 @@ if (_challengeClaimed)
                                 ),
                               ),
                               const SizedBox(width: 10),
-                              Text('$_challengeProg/${_challenge!.target}',
+                              // Once claimed the challenge stays complete,
+                              // even if a habit is unchecked later today.
+                              Text(
+                                  _challengeClaimed
+                                      ? '${max(_challenge!.target, 1)}/${max(_challenge!.target, 1)}'
+                                      : '$_challengeProg/${_challenge!.target}',
                                   style: TextStyle(
                                       fontSize: 12,
                                       color: Colors.grey.shade500)),
@@ -3983,7 +4035,7 @@ if (_challengeClaimed)
         fontSize: 14, fontWeight: FontWeight.bold)),
 const Spacer(),
 if (_moodStreak >= 2)
-  Text(t('🔥 $_moodStreak أيام', '🔥 $_moodStreak days'),
+  Text('🔥 ${daysLabel(_moodStreak)}',
       style: TextStyle(
           fontSize: 12, color: Colors.deepOrange)),
                       ],
@@ -4046,7 +4098,9 @@ Text(t('محلي · خاص', 'Local · private'),
                           child: Text(s,
                               style: TextStyle(
                                   fontSize: 13,
-                                  color: Colors.grey.shade300)),
+                                  color: Theme.of(context)
+                                      .colorScheme
+                                      .onSurfaceVariant)),
                         ),
                     ],
                   ),
@@ -4118,12 +4172,14 @@ Text(t('محلي · خاص', 'Local · private'),
                 final done = habit.isDoneOn(DateTime.now());
                 final streak = habit.currentStreak();
                 final amount = habit.amountOn(DateTime.now());
+                final onDone = Theme.of(context).colorScheme.onPrimary;
+                final onDoneSoft = onDone.withAlpha(200);
                 return Dismissible(
                   key: Key(habit.name + i.toString()),
                   direction: DismissDirection.endToStart,
                   background: Container(
-                    alignment: Alignment.centerRight,
-                    padding: const EdgeInsets.only(right: 20),
+                    alignment: AlignmentDirectional.centerEnd,
+                    padding: const EdgeInsetsDirectional.only(end: 20),
                     margin: const EdgeInsets.only(bottom: 12),
                     decoration: BoxDecoration(
                       color: Colors.red.withAlpha(77),
@@ -4215,7 +4271,7 @@ child: Material(
                                 ],
                         ),
                         child: Icon(habit.icon,
-                            color: Colors.white, size: 26),
+                            color: done ? onDone : Colors.white, size: 26),
                       ),
                       title: Text(
                         habit.name,
@@ -4224,7 +4280,7 @@ child: Material(
                           fontWeight: FontWeight.w600,
                           decoration:
                               done ? TextDecoration.lineThrough : null,
-                          color: done ? Colors.white : null,
+                          color: done ? onDone : null,
                         ),
                       ),
                       subtitle: Column(
@@ -4245,20 +4301,20 @@ child: Material(
                                             : 0,
                                         minHeight: 8,
                                         backgroundColor: done
-                                            ? Colors.white.withAlpha(50)
+                                            ? onDone.withAlpha(50)
                                             : secondaryColor(brightness),
                                         color: done
-                                            ? Colors.white
+                                            ? onDone
                                             : primary,
                                       ),
                                     ),
                                   ),
                                   const SizedBox(width: 10),
                                   Text(
-                                    '${_fmt(amount)}/${_fmt(habit.target)}${habit.unit.isEmpty ? '' : ' ${habit.unit}'}',
+                                    '${ltr('${_fmt(amount)}/${_fmt(habit.target)}')}${habit.unit.isEmpty ? '' : ' ${habit.unit}'}',
                                     style: TextStyle(
                                         color: done
-                                            ? Colors.white
+                                            ? onDone
                                             : primary,
                                         fontSize: 11,
                                         fontWeight: FontWeight.bold),
@@ -4274,18 +4330,15 @@ child: Material(
                                   if (AuthService.isProUser &&
                                       streak > 0) ...[
                                     if (done) ...[
-                                      const Icon(
+                                      Icon(
                                           Icons.local_fire_department,
-                                          color: Colors.white60,
+                                          color: onDoneSoft,
                                           size: 14),
                                       const SizedBox(width: 3),
                                       Text(
-                                          t('$streak يوم',
-                                              streak == 1
-                                                  ? '$streak day'
-                                                  : '$streak days'),
-                                          style: const TextStyle(
-                                              color: Colors.white60,
+                                          daysLabel(streak),
+                                          style: TextStyle(
+                                              color: onDoneSoft,
                                               fontSize: 11)),
                                       const SizedBox(width: 8),
                                     ] else ...[
@@ -4314,11 +4367,7 @@ child: Material(
                                                   size: 14),
                                               const SizedBox(width: 4),
                                               Text(
-                                                  t(
-                                                      '$streak يوم',
-                                                      streak == 1
-                                                          ? '$streak day'
-                                                          : '$streak days'),
+                                                  daysLabel(streak),
                                                   style: const TextStyle(
                                                       color:
                                                           Colors.white,
@@ -4372,7 +4421,7 @@ child: Material(
                                         '⏱ ${habit.timerMinutes} ${t('دقيقة', 'min')}',
                                         style: TextStyle(
                                             color: done
-                                                ? Colors.white60
+                                                ? onDoneSoft
                                                 : Colors.grey.shade500,
                                             fontSize: 11)),
                                     const SizedBox(width: 8),
@@ -4382,7 +4431,7 @@ child: Material(
                                     Text(_weekdayShort(habit.weekdays),
                                         style: TextStyle(
                                             color: done
-                                                ? Colors.white60
+                                                ? onDoneSoft
                                                 : Colors.grey.shade500,
                                             fontSize: 11)),
                                   if (habit.isFlexible)
@@ -4392,7 +4441,7 @@ child: Material(
                                             '${habit.timesPerWeek}x/week'),
                                         style: TextStyle(
                                             color: done
-                                                ? Colors.white60
+                                                ? onDoneSoft
                                                 : Colors.grey.shade500,
                                             fontSize: 11)),
                                   if (habit.isQuit &&
@@ -4400,14 +4449,12 @@ child: Material(
                                     Text(
                                         (AuthService.isProUser &&
                                                 streak > 0)
-                                            ? t(
-                                                '🍃 أنظف · $streak يوم',
-                                                '🍃 Clean · $streak ${streak == 1 ? 'day' : 'days'}')
+                                            ? '🍃 ${t('أنظف', 'Clean')} · ${daysLabel(streak)}'
                                             : t('حافظ على نظافتها',
                                                 'Keep it clean'),
                                         style: TextStyle(
                                             color: done
-                                                ? Colors.white60
+                                                ? onDoneSoft
                                                 : Colors.grey.shade500,
                                             fontSize: 11)),
                                   if (habit.reminderEnabled) ...[
@@ -4417,7 +4464,7 @@ child: Material(
                                             .notifications_active_outlined,
                                         size: 14,
                                         color: done
-                                            ? Colors.white60
+                                            ? onDoneSoft
                                             : Colors.grey.shade500),
                                   ],
                                 ],
@@ -4540,36 +4587,40 @@ child: Material(
           ],
         ),
       ),
-      floatingActionButton: Material(
-        color: Colors.transparent,
-        child: Ink(
-          width: 64,
-          height: 64,
-          decoration: BoxDecoration(
-            shape: BoxShape.circle,
-            gradient: LinearGradient(
-              colors: [
-                Theme.of(context).colorScheme.primary,
-                Theme.of(context).colorScheme.tertiary,
-              ],
-              begin: Alignment.topLeft,
-              end: Alignment.bottomRight,
-            ),
-            boxShadow: [
-              BoxShadow(
-                color: Theme.of(context)
-                    .colorScheme
-                    .primary
-                    .withValues(alpha: 0.32),
-                blurRadius: 20,
-                offset: const Offset(0, 6),
-              ),
+      // The gradient and shadow live on a plain circular Container; a
+      // rectangular Material around an Ink clipped the shadow into a square.
+      floatingActionButton: Container(
+        width: 64,
+        height: 64,
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          gradient: LinearGradient(
+            colors: [
+              Theme.of(context).colorScheme.primary,
+              Theme.of(context).colorScheme.tertiary,
             ],
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
           ),
+          boxShadow: [
+            BoxShadow(
+              color: Theme.of(context)
+                  .colorScheme
+                  .primary
+                  .withValues(alpha: 0.32),
+              blurRadius: 20,
+              offset: const Offset(0, 6),
+            ),
+          ],
+        ),
+        child: Material(
+          type: MaterialType.transparency,
+          shape: const CircleBorder(),
+          clipBehavior: Clip.antiAlias,
           child: InkWell(
-            customBorder: const CircleBorder(),
             onTap: _showAddDialog,
-            child: const Icon(Icons.add, color: Colors.white, size: 30),
+            child: Icon(Icons.add,
+                color: Theme.of(context).colorScheme.onPrimary, size: 30),
           ),
         ),
       ),
@@ -4632,6 +4683,7 @@ class AdBannerWidget extends StatefulWidget {
 
 class _AdBannerWidgetState extends State<AdBannerWidget> {
   BannerAd? _banner;
+  bool _loaded = false;
 
   @override
   void initState() {
@@ -4641,8 +4693,13 @@ class _AdBannerWidgetState extends State<AdBannerWidget> {
       size: AdSize.banner,
       request: const AdRequest(),
       listener: BannerAdListener(
-        onAdLoaded: (_) => setState(() {}),
-        onAdFailedToLoad: (ad, error) => ad.dispose(),
+        onAdLoaded: (_) {
+          if (mounted) setState(() => _loaded = true);
+        },
+        onAdFailedToLoad: (ad, error) {
+          ad.dispose();
+          if (mounted) setState(() => _banner = null);
+        },
       ),
     )..load();
   }
@@ -4655,7 +4712,8 @@ class _AdBannerWidgetState extends State<AdBannerWidget> {
 
   @override
   Widget build(BuildContext context) {
-    if (_banner == null) return const SizedBox.shrink();
+    // Reserve no space until an ad has actually loaded.
+    if (_banner == null || !_loaded) return const SizedBox.shrink();
     return Container(
       color: Theme.of(context).brightness == Brightness.dark
           ? const Color(0xFF1C2127)
@@ -4800,7 +4858,7 @@ class _NavItem extends StatelessWidget {
                 curve: Curves.easeOutCubic,
                 child: active
                     ? Padding(
-                        padding: const EdgeInsets.only(left: 8),
+                        padding: const EdgeInsetsDirectional.only(start: 8),
                         child: Text(
                           label,
                           style: const TextStyle(
@@ -4954,16 +5012,29 @@ class _ProPageState extends State<ProPage> {
     final primary = Theme.of(context).colorScheme.primary;
     final brightness = Theme.of(context).brightness;
 
+    // Keep this list in sync with the AuthService.isProUser checks.
     final features = [
       (Icons.block, t('بلا إعلانات', 'No ads'),
-          t('إزالة كل الإعلانات نهائياً', 'Remove all ads for good')),
+          t('إزالة إعلان الشاشة الرئيسية', 'Remove the banner ad on the home screen')),
       (Icons.all_inclusive, t('عادات غير محدودة', 'Unlimited habits'),
-          t('أضف عدداً غير محدود من العادات', 'Add an unlimited number of habits')),
+          t('المجاني حتى 3 عادات — برو بلا حد', 'Free allows 3 habits — Pro has no limit')),
+      (Icons.straighten, t('عادات قابلة للقياس ومؤقت', 'Measurable & timer habits'),
+          t('أهداف بوحدات (صفحات، دقائق…) وعدّاد تنازلي',
+              'Goals with units (pages, minutes…) and a countdown timer')),
+      (Icons.notifications_active, t('تذكير لكل عادة', 'Per-habit reminders'),
+          t('تذكير يومي بوقت خاص لكل عادة', 'A daily reminder at its own time for each habit')),
+      (Icons.emoji_events, t('مستويات وشارات وتحديات', 'Levels, badges & challenges'),
+          t('نقاط XP، تحدي يومي، تسجيل المزاج ورؤى ذكية',
+              'XP, a daily challenge, mood check-ins and smart insights')),
+      (Icons.insights, t('تحليلات متقدمة', 'Advanced analytics'),
+          t('ملخص الأسبوع، الرسوم البيانية، خرائط النشاط والإنجازات',
+              'Weekly recap, charts, activity heatmaps and achievements')),
+      (Icons.palette, t('تخصيص كامل', 'Full customisation'),
+          t('مكتبة الأيقونات الكاملة ولون مخصص للتطبيق',
+              'The full icon library and a custom app colour')),
       (Icons.cloud_done, t('نسخ احتياطي واستعادة', 'Backup & restore'),
-          t('احفظ واستعد بياناتك في أي وقت', 'Save and restore your data anytime')),
-      (Icons.new_releases, t('مميزات جديدة أولاً', 'New features first'),
-          t('احصل على كل ميزة جديدة قبل أي شخص آخر',
-              'Get every new feature before anyone else')),
+          t('صدّر بياناتك لملف واستعدها في أي وقت',
+              'Export your data to a file and restore it anytime')),
     ];
 
     return Scaffold(
@@ -4977,8 +5048,15 @@ class _ProPageState extends State<ProPage> {
           Container(
             padding: const EdgeInsets.all(24),
             decoration: BoxDecoration(
+              // The dark-mode primary is a light pastel; darken it so the
+              // white hero text and logo stay readable.
               gradient: LinearGradient(
-                colors: [primary, primary.withAlpha(150)],
+                colors: brightness == Brightness.dark
+                    ? [
+                        Color.lerp(primary, Colors.black, 0.45)!,
+                        Color.lerp(primary, Colors.black, 0.25)!,
+                      ]
+                    : [primary, primary.withAlpha(150)],
                 begin: Alignment.topLeft,
                 end: Alignment.bottomRight,
               ),
@@ -4986,10 +5064,10 @@ class _ProPageState extends State<ProPage> {
             ),
             child: Column(
               children: [
+                // White text sits on the primary gradient, so the logo is
+                // always the white variant.
                 Image.asset(
-                  brightness == Brightness.dark
-                      ? 'assets/icon/logo_white.png'
-                      : 'assets/icon/logo_black.png',
+                  'assets/icon/logo_white.png',
                   height: 70,
                 ),
                 const SizedBox(height: 12),
@@ -5261,7 +5339,11 @@ Future<void> showHabitDialog(
             ),
           ],
         ),
-        content: SingleChildScrollView(
+        // AlertDialog measures intrinsic width; a fixed width keeps it from
+        // querying the horizontal icon GridView (a viewport), which throws.
+        content: SizedBox(
+          width: double.maxFinite,
+          child: SingleChildScrollView(
           child: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -5642,6 +5724,7 @@ Future<void> showHabitDialog(
             ],
           ),
         ),
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(ctx),
@@ -5879,12 +5962,12 @@ class _HabitDetailPageState extends State<HabitDetailPage> {
       context: context,
       builder: (ctx) => AlertDialog(
         backgroundColor: cardColor(Theme.of(context).brightness),
-        title: Text(t('سجّل "${habit.name}"', 'Log "${habit.name}"')),
+        title: Text(t('سجّل "${iso(habit.name)}"', 'Log "${habit.name}"')),
         content: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
             Text(t(
-                'اليوم: ${_fmtD(recorded)} / ${_fmtD(habit.target)}${habit.unit.isEmpty ? '' : ' ${habit.unit}'}',
+                'اليوم: ${ltr('${_fmtD(recorded)} / ${_fmtD(habit.target)}')}${habit.unit.isEmpty ? '' : ' ${habit.unit}'}',
                 'Today: ${_fmtD(recorded)} / ${_fmtD(habit.target)}${habit.unit.isEmpty ? '' : ' ${habit.unit}'}')),
             const SizedBox(height: 12),
             TextField(
@@ -5909,7 +5992,7 @@ class _HabitDetailPageState extends State<HabitDetailPage> {
               children: [
                 for (final q in [1.0, 2.0, 5.0, 10.0])
                   ActionChip(
-                    label: Text('+${_fmtD(q)}'),
+                    label: Text(ltr('+${_fmtD(q)}')),
                     onPressed: () => Navigator.pop(ctx, q),
                   ),
               ],
@@ -6005,7 +6088,7 @@ class _HabitDetailPageState extends State<HabitDetailPage> {
         backgroundColor: cardColor(Theme.of(context).brightness),
         title: Text(t('حذف العادة؟', 'Delete habit?')),
         content: Text(t(
-            'حذف "${widget.habit.name}" وكل تاريخها؟ لا يمكن التراجع عن هذا.',
+            'حذف "${iso(widget.habit.name)}" وكل تاريخها؟ لا يمكن التراجع عن هذا.',
             'Delete "${widget.habit.name}" and all its history? This cannot be undone.')),
         actions: [
           TextButton(
@@ -6035,7 +6118,7 @@ class _HabitDetailPageState extends State<HabitDetailPage> {
     final today = DateTime.now();
 
     // heatmap: 12 weeks aligned to Sunday
-    final start = today.subtract(Duration(days: 77 + (today.weekday % 7)));
+    final start = addDays(today, -(77 + (today.weekday % 7)));
 
     return Scaffold(
       appBar: AppBar(
@@ -6125,7 +6208,7 @@ class _HabitDetailPageState extends State<HabitDetailPage> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    t('اليوم: ${_fmtD(habit.amountOn(today))} / ${_fmtD(habit.target)}${habit.unit.isEmpty ? '' : ' ${habit.unit}'}',
+                    t('اليوم: ${ltr('${_fmtD(habit.amountOn(today))} / ${_fmtD(habit.target)}')}${habit.unit.isEmpty ? '' : ' ${habit.unit}'}',
                         'Today: ${_fmtD(habit.amountOn(today))} / ${_fmtD(habit.target)}${habit.unit.isEmpty ? '' : ' ${habit.unit}'}'),
                     style: const TextStyle(fontSize: 15),
                   ),
@@ -6194,16 +6277,14 @@ class _HabitDetailPageState extends State<HabitDetailPage> {
             children: [
               _StatCard(
                 title: t('السلسلة الحالية', 'Current streak'),
-                value: t('$_currentStreak يوم',
-                    '$_currentStreak ${_currentStreak == 1 ? 'day' : 'days'}'),
+                value: daysLabel(_currentStreak),
                 icon: Icons.local_fire_department,
                 color: Colors.orange,
               ),
               const SizedBox(width: 12),
               _StatCard(
                 title: t('أطول سلسلة', 'Longest streak'),
-                value: t('$_longestStreak يوم',
-                    '$_longestStreak ${_longestStreak == 1 ? 'day' : 'days'}'),
+                value: daysLabel(_longestStreak),
                 icon: Icons.emoji_events,
                 color: primary,
               ),
@@ -6246,10 +6327,10 @@ class _HabitDetailPageState extends State<HabitDetailPage> {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: List.generate(12, (col) {
                     return Padding(
-                      padding: const EdgeInsets.only(right: 4),
+                      padding: const EdgeInsetsDirectional.only(end: 4),
                       child: Column(
                         children: List.generate(7, (row) {
-                          final day = start.add(Duration(days: col * 7 + row));
+                          final day = addDays(start, col * 7 + row);
                           final isFuture = day.isAfter(
                               DateTime(today.year, today.month, today.day));
                           final done =
@@ -6338,7 +6419,7 @@ class _StatsPageState extends State<StatsPage> {
   List<double> _last7DaysPercent() {
     final today = DateTime.now();
     return List.generate(7, (i) {
-      final day = today.subtract(Duration(days: 6 - i));
+      final day = addDays(today, -(6 - i));
       if (habits.isEmpty) return 0.0;
       final done = habits.where((h) => h.isDoneOn(day)).length;
       return done / habits.length * 100;
@@ -6350,7 +6431,11 @@ class _StatsPageState extends State<StatsPage> {
     final primary = Theme.of(context).colorScheme.primary;
     final brightness = Theme.of(context).brightness;
     final week = _last7DaysPercent();
-    final todayIndex = DateTime.now().weekday % 7;
+    // Bars are the last 7 days ending today, so bar i is (today - (6 - i))
+    // and today is always the last bar.
+    const todayIndex = 6;
+    String barLabel(int i) =>
+        weekdayShortLabel(addDays(DateTime.now(), -(6 - i)).weekday);
     final totalCompletions = habits.fold<int>(
         0, (sum, h) => sum + h.countCompletions());
 
@@ -6369,7 +6454,7 @@ class _StatsPageState extends State<StatsPage> {
     var done30 = 0, due30 = 0;
     for (final h in habits) {
       for (int i = 0; i < 30; i++) {
-        final d = DateTime.now().subtract(Duration(days: i));
+        final d = addDays(DateTime.now(), -i);
         if (h.isDueOn(d)) {
           due30++;
           if (h.isDoneOn(d)) done30++;
@@ -6389,7 +6474,7 @@ class _StatsPageState extends State<StatsPage> {
     final dayTotals = <int, int>{};
     for (final h in habits) {
       for (var i = 0; i < 7; i++) {
-        final day = weekStart.add(Duration(days: i));
+        final day = addDays(weekStart, i);
         if (day.isAfter(now)) continue;
         if (h.isDueOn(day)) {
           dueWeek++;
@@ -6411,7 +6496,7 @@ class _StatsPageState extends State<StatsPage> {
     for (final h in habits) {
       var cnt = 0;
       for (var i = 0; i < 7; i++) {
-        final day = weekStart.add(Duration(days: i));
+        final day = addDays(weekStart, i);
         if (!day.isAfter(now) && h.isDoneOn(day)) cnt++;
       }
       if (cnt >= weekBestDays && cnt > 0) {
@@ -6422,7 +6507,7 @@ class _StatsPageState extends State<StatsPage> {
     final weekComebacks = <String>[];
     for (final h in habits) {
       for (var i = 0; i < 7; i++) {
-        final day = weekStart.add(Duration(days: i));
+        final day = addDays(weekStart, i);
         if (!day.isAfter(now) && h.isComebackOn(day)) {
           weekComebacks.add(h.name);
           break;
@@ -6457,7 +6542,7 @@ class _StatsPageState extends State<StatsPage> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(t('المستوى $_level · $_xp XP', 'Level $_level · $_xp XP'),
+                      Text(t('المستوى $_level · ${ltr('$_xp XP')}', 'Level $_level · $_xp XP'),
                           style: const TextStyle(
                               fontWeight: FontWeight.bold, fontSize: 15)),
                       const SizedBox(height: 6),
@@ -6483,15 +6568,14 @@ class _StatsPageState extends State<StatsPage> {
             children: [
               _StatCard(
                 title: t('السلسلة الحالية', 'Current streak'),
-                value: t('$currentStreakAny يوم',
-                    '$currentStreakAny ${currentStreakAny == 1 ? 'day' : 'days'}'),
+                value: daysLabel(currentStreakAny),
                 icon: Icons.local_fire_department,
                 color: Colors.deepOrange,
               ),
               const SizedBox(width: 12),
               _StatCard(
                 title: t('أفضل سلسلة', 'Best streak'),
-                value: t('$bestStreak يوم', '$bestStreak ${bestStreak == 1 ? 'day' : 'days'}'),
+                value: daysLabel(bestStreak),
                 icon: Icons.emoji_events,
                 color: Colors.amber,
               ),
@@ -6565,7 +6649,7 @@ class _StatsPageState extends State<StatsPage> {
                   t(
                     dueWeek == 0
                         ? 'لم تعد أي مهمة هذا الأسبوع بعد — أضف عاداتك أولاً.'
-                        : 'أنجزت $doneWeek من $dueWeek تحدي. ${weekRate == 100 ? 'أسبوع مثالي 👏' : 'كمّل وكسر رقمك بالأيام الجاية.'}',
+                        : 'أنجزت $doneWeek من $dueWeek مهمة مجدولة. ${weekRate == 100 ? 'أسبوع مثالي 👏' : 'كمّل وكسر رقمك بالأيام الجاية.'}',
                     dueWeek == 0
                         ? 'No tasks were due this week yet — add habits first.'
                         : 'Completed $doneWeek of $dueWeek scheduled. ${weekRate == 100 ? 'Perfect week 👏' : 'Keep going and beat it next week.'}',
@@ -6585,7 +6669,7 @@ class _StatsPageState extends State<StatsPage> {
                   _RecapLine(
                     icon: Icons.check_circle,
                     text: t(
-                        'الثابت الكبير: "${weekBestHabit.name}" — $weekBestDays يوم',
+                        'الثابت الكبير: "${iso(weekBestHabit.name)}" — ${daysAr(weekBestDays)}',
                         'Rock of the week: "${weekBestHabit.name}" — $weekBestDays day(s)'),
                   ),
                 if (weekComebacks.isNotEmpty)
@@ -6626,7 +6710,7 @@ class _StatsPageState extends State<StatsPage> {
                     sideTitles: SideTitles(
                       showTitles: true,
                       getTitlesWidget: (value, meta) => Text(
-                        dayAxisLabel(value.toInt()),
+                        barLabel(value.toInt()),
                         style: TextStyle(
                           color: value.toInt() == todayIndex
                               ? primary
@@ -6933,7 +7017,7 @@ class _StatsPageState extends State<StatsPage> {
                               t('$hRate30% آخر 30 يوم · إجمالي $hTotal',
                                   '$hRate30% last 30 days · $hTotal total') +
                                   (h.isMeasurable
-                                      ? ' · ${h.target.toStringAsFixed(h.target.truncateToDouble() == h.target ? 0 : 1)} ${h.unit.trim()}'
+                                      ? ' · ${ltr(h.target.toStringAsFixed(h.target.truncateToDouble() == h.target ? 0 : 1))} ${h.unit.trim()}'
                                       : ''),
                               style: TextStyle(
                                   fontSize: 12, color: Colors.grey.shade500)),
@@ -7104,7 +7188,7 @@ class WeekGrid extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final now = DateTime.now();
-    final start = Habit.mondayOf(now).subtract(Duration(days: 7 * (weeks - 1)));
+    final start = addDays(Habit.mondayOf(now), -(7 * (weeks - 1)));
     return Column(
       children: [
         Row(
@@ -7131,7 +7215,7 @@ class WeekGrid extends StatelessWidget {
                 SizedBox(
                   width: 42,
                   child: Text(
-                    '${start.add(Duration(days: wi * 7)).day}/${start.add(Duration(days: wi * 7)).month}',
+                    '${addDays(start, wi * 7).day}/${addDays(start, wi * 7).month}',
                     style: TextStyle(fontSize: 9, color: Colors.grey.shade400),
                   ),
                 ),
@@ -7144,12 +7228,12 @@ class WeekGrid extends StatelessWidget {
                         decoration: BoxDecoration(
                           color: heatColor(
                             dayRate(habits,
-                                start.add(Duration(days: wi * 7 + d))),
+                                addDays(start, wi * 7 + d)),
                             primary,
                             bg,
                           ),
                           borderRadius: BorderRadius.circular(5),
-                          border: sameDay(start.add(Duration(days: wi * 7 + d)), now)
+                          border: sameDay(addDays(start, wi * 7 + d), now)
                               ? Border.all(color: primary, width: 1.6)
                               : null,
                         ),
@@ -7185,8 +7269,8 @@ class MonthHeatmap extends StatelessWidget {
     final dark = Theme.of(context).brightness == Brightness.dark;
     final rows = <Widget>[];
     for (var d = start;
-        d.isBefore(last.add(const Duration(days: 1)));
-        d = d.add(const Duration(days: 7))) {
+        d.isBefore(addDays(last, 1));
+        d = addDays(d, 7)) {
       rows.add(
         Row(
           children: [
@@ -7195,7 +7279,7 @@ class MonthHeatmap extends StatelessWidget {
                 child: AspectRatio(
                   aspectRatio: 1,
                   child: () {
-                    final date = d.add(Duration(days: i));
+                    final date = addDays(d, i);
                     if (date.month != now.month) return const SizedBox.shrink();
                     final rate = dayRate(habits, date);
                     return Container(
@@ -7230,9 +7314,10 @@ class MonthHeatmap extends StatelessWidget {
     }
     return Column(
       children: [
+        // No leading spacer: the day rows below have none, so headers line
+        // up with their columns.
         Row(
           children: [
-            const SizedBox(width: 44),
             for (var w = 0; w < 7; w++) ...[
               Expanded(
                 child: Center(
@@ -7260,7 +7345,11 @@ class MonthHeatmap extends StatelessWidget {
                 height: 12,
                 decoration: BoxDecoration(
                   borderRadius: BorderRadius.circular(6),
+                  // Runs from the "Less" label to the "More" label in both
+                  // LTR and RTL.
                   gradient: LinearGradient(
+                    begin: AlignmentDirectional.centerStart,
+                    end: AlignmentDirectional.centerEnd,
                     colors: [
                       bg,
                       primary.withAlpha(24 + (25 * 2.2).round()),
@@ -7302,7 +7391,7 @@ class YearHeatmap extends StatelessWidget {
     final today = DateTime.now();
     final todayMid = DateTime(today.year, today.month, today.day);
     final gridStart =
-        Habit.mondayOf(todayMid.subtract(const Duration(days: 364)));
+        Habit.mondayOf(addDays(todayMid, -364));
     final colCount = ((todayMid.difference(gridStart).inDays + 1) / 7).ceil();
 
     return LayoutBuilder(
@@ -7321,9 +7410,9 @@ class YearHeatmap extends StatelessWidget {
             );
 
         String? label(int col) {
-          final weekMonday = gridStart.add(Duration(days: col * 7));
+          final weekMonday = addDays(gridStart, col * 7);
           if (weekMonday.month ==
-              weekMonday.subtract(const Duration(days: 7)).month) {
+              addDays(weekMonday, -7).month) {
             return null;
           }
           return monthLabel(weekMonday.month);
@@ -7339,10 +7428,15 @@ class YearHeatmap extends StatelessWidget {
                   for (var c = 0; c < colCount; c++)
                     SizedBox(
                       width: step,
+                      // Month labels are wider than one column; let them
+                      // run into the next (empty) columns instead of
+                      // wrapping letter by letter.
                       child: Text(
                         label(c) ?? '',
                         style: const TextStyle(fontSize: 8),
-                        overflow: TextOverflow.clip,
+                        maxLines: 1,
+                        softWrap: false,
+                        overflow: TextOverflow.visible,
                       ),
                     ),
                 ],
@@ -7352,7 +7446,7 @@ class YearHeatmap extends StatelessWidget {
                 Row(
                   children: [
                     for (var c = 0; c < colCount; c++)
-                      slot(gridStart.add(Duration(days: c * 7 + r))),
+                      slot(addDays(gridStart, c * 7 + r)),
                   ],
                 ),
             ],
@@ -7457,7 +7551,7 @@ class _SettingsPageState extends State<SettingsPage> {
       final moodMap = <String, int>{};
       final now = DateTime.now();
       for (var i = 0; i < 730; i++) {
-        final d = now.subtract(Duration(days: i));
+        final d = addDays(now, -i);
         final k = 'mood_${email ?? 'guest'}_${dayKey(d)}';
         final v = prefs.getInt(k);
         if (v != null) moodMap[dayKey(d)] = v;
